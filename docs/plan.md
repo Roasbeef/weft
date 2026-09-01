@@ -12,7 +12,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/actor` | [#4](https://github.com/Roasbeef/weft/issues/4) (closed) | `3cf3436`..`3b70c62` | Superset of upstream; continues, `on_shutdown`, hibernation, idle timeout |
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
-| `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (open) | `engine/managed-tasks` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane |
+| `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -87,11 +87,14 @@ the engine's module doc:
 
 ## Publishing
 
-The name `weft` is free on hex.pm (checked 2026-08-31). Checklist:
-`LICENCE` and `NOTICE` are in the tree; `gleam publish` from the root
-builds, uploads, and pushes hexdocs in one step (needs a hex account and
-API key). Publish `0.1.0` first; `1.0.0` is the API freeze and should wait
-for the deferred engine follow-ups to settle the `weft` module's surface.
+`0.1.0` is on hex.pm (published 2026-09-01). `0.2.0` carries managed
+tasks (#5) and is an additive minor: two new `Outcome` variants
+(`DrainProofLost`, `CancellationUnconfirmed`), so a consumer matching
+exhaustively on `Outcome` gains two arms and nothing else moves.
+`gleam publish` from the root builds, uploads, and pushes hexdocs in one
+step (needs a hex account and API key). `1.0.0` is the API freeze and
+should wait for the deferred engine follow-ups to settle the `weft`
+module's surface.
 
 ## Verification standard (unchanged)
 
