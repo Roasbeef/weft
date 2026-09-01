@@ -13,7 +13,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
 | `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
-| `weft/poll` | loom#159 phase 2 | main | Bounded synchronous polling for foreground waits; owns no process |
+| `weft/poll` | loom#159 phase 2 | `0.4.0` | Bounded synchronous polling for foreground waits; owns no process |
 | `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.3.1` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.3.1), `cancel_when_exits`; many owners per task |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
@@ -116,10 +116,12 @@ additive: no existing signature or variant changes. `0.3.1` changes one
 signature published hours earlier: `start_witnessed` returns a
 `Witnessed` handle (`witness_pid`, `cancel_witnessed`) rather than a bare
 pid, because a witness-only caller still has to be able to cancel without
-paying a signal process per run. From here the loom adoption develops
+paying a signal process per run. The rest of loom's phase 2 developed
 against a **path dependency** on this checkout rather than a hex release
-per change; `main` carries a working version number and the next hex
-release is `0.4.0`, cut once loom's phase 2 has settled the surface.
+per change, and `0.4.0` is that settled surface: `adopt_under` /
+`adopt_leaf_under`, a pid that may be both watched and adopted, `unlinked`
+start on the actor and machine, `with_selector` on a machine step, and
+`weft/poll`. Every addition since 0.3.1 is additive.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`
