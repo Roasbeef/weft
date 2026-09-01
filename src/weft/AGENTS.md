@@ -9,8 +9,15 @@ makes sense whole.
 - **`weft`** (in `src/`, not this directory) — the run engine. One scope
   process per run, trapping exits, workers linked to it; delivery to the
   caller is pull-based (`Delivered` carries the scope's inbox, caller
-  answers `Next`/`Stop`). Depends only on `gleam_erlang/process`; does NOT
-  use `weft/actor` or the internals — the scope's kill-then-join teardown
+  answers `Next`/`Stop`). Managed tasks (`prepared_task`/`prepared_leaf`)
+  add an owner ledger: every published owner is monitored before the first
+  worker spawns, a managed slot is held until worker AND owner have exited,
+  and the scope's own exit reason carries the run's drain verdict (normal =
+  every proof landed; `weft_drain_proof_lost` / `weft_drain_unconfirmed`
+  otherwise). Detached runs (`start_detached`/`pull`/`cancel_detached`/
+  `start_relayed`) reuse the same pull protocol behind a handle. Depends on
+  `gleam_erlang/process` and `internal/sys` (the scope answers the system
+  plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
   and slot scheduling would contort an actor loop.
 - **`weft/actor`** — the superset actor. Owns the house receive loop:
   injected-message queue (continues), the timer book for its idle timeout,
@@ -35,9 +42,12 @@ makes sense whole.
 
 ## Message traffic, concretely
 
-- Engine: caller ⇄ scope via `Reply(a, e)` (`Delivered`/`Done`) and
-  `Request` (`Next`/`Stop`); workers → scope via `Report(worker, index,
-  result)` then their linked `EXIT`; cancel signals are watched by monitor.
+- Engine: caller ⇄ scope via `Reply(a, e)` (`Ready`/`Delivered`/`Done`)
+  and `Request` (`Next`/`Stop`/`CancelRun`); workers → scope via
+  `Report(worker, index, result)` then their linked `EXIT`; cancel signals
+  and managed owners are watched by monitor (one generic monitor arm,
+  discriminated by pid); each owner's `cancel` runs on a disposable linked
+  helper whose `EXIT` is bookkeeping, not an outcome.
 - Actor: one user-typed `message` per actor; system messages arrive as
   `sys.Incoming` via a record selector, timers as `timer.Fired(TimerKey,
   message)`.
@@ -58,22 +68,32 @@ makes sense whole.
    mailbox, injected queues, postponed replay, and timers (disarm on
    suspend, re-arm from full on resume).
 5. **Kill-then-join, in that order** (engine `begin_cancel`): all kills
-   sent before any `EXIT` is awaited.
-6. **Depth-first injection everywhere**: what a handler injects runs
+   sent before any `EXIT` is awaited. Owners are the exception by design:
+   they are *asked* (their `cancel`, on a helper) and never killed —
+   killing the owner destroys the one process whose exit still proves
+   anything.
+6. **A managed outcome is sealed by its proof at exactly one place**
+   (`note_outcome`/`seal_outcome`): worker facts and owner facts meet
+   there, and `settled` refuses to end the run while any owner is
+   `ProofPending` or `ProofAbsent` or any helper is alive. Delivering an outcome whose
+   owner has not resolved re-opens the ownership hole weft#5 closed.
+7. **Depth-first injection everywhere**: what a handler injects runs
    before what was already queued; in the state machine the full order
    after a transition is enter-injected, then handler-injected, then
    replayed postponed events (arrival order), then the mailbox.
-7. **The engine's scope unlinks the caller itself in `finish`** — moving
+8. **The engine's scope unlinks the caller itself in `finish`** — moving
    that unlink, or doing it caller-side, reintroduces exit-message noise
-   for trapping callers.
-8. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
-   FFI stays inside it; the one exception is the engine's
-   `erlang:system_info(schedulers_online)` external, argued in place.
+   for trapping callers; the drain verdict travels by monitor (the
+   `erlang:exit/1` after the unlink), never down the link.
+9. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
+   FFI stays inside it; the exceptions are the engine's
+   `erlang:system_info(schedulers_online)` and `erlang:exit/1` externals,
+   both stock BIFs argued in place.
 
 ## Dependency edges (enforced by review, not tooling)
 
 ```
-weft ──────────────► gleam_erlang/process
+weft ──────────────► gleam_erlang/process, internal/sys
 weft/actor ────────► internal/{sys,timer}, gleam_otp (types only)
 weft/state_machine ► internal/{sys,timer}, gleam_otp (types only)
 weft/event_manager ► weft/actor, internal/sys (warn ONLY)

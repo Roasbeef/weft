@@ -74,6 +74,46 @@
 //// single burst: those are three-word records and the task list was already a
 //// materialised list, so the cost is one that the caller had already paid.
 ////
+//// ## Managed tasks, and what an owner's exit proves
+////
+//// The contract above conflates two facts on purpose — for a leaf task,
+//// "the worker exited" and "the work stopped" are the same fact. They stop
+//// being the same fact the moment a task's real work lives beyond its
+//// worker: an HTTP request whose socket belongs to a client library's own
+//// supervisor, a database operation running under a pool. The worker can
+//// return while the process holding the socket is still alive, and killing
+//// the worker may kill the only process that still carries the child's
+//// cancellation capability.
+////
+//// A *managed* task (`prepared_task`) splits the two facts apart. It
+//// carries, in addition to `begin`, a published **owner** pid — the process
+//// whose exit is the lifecycle truth for everything the task started — and
+//// a `cancel` closure that asks that subtree to stop. The scope monitors
+//// every owner *before it spawns a single worker*, so by the time `begin`
+//// can touch the outside world its ownership evidence is already on file;
+//// there is no window in which externally visible work exists and nobody
+//// holds proof of it. A managed task's slot is then held until **both** its
+//// worker and its owner have exited, and its outcome is delivered only once
+//// both facts are in.
+////
+//// Only a *normal* owner exit proves the subtree drained. An abnormal one
+//// means the proof is gone — not that the work failed, but that nobody can
+//// any longer say whether it stopped — and that is a different outcome,
+//// `DrainProofLost`, kept apart from `Crashed` because a caller recovering
+//// resources must treat "unknown liveness" differently from "known death".
+//// A `prepared_leaf` owner is the documented exemption: a task may declare
+//// that its owner provably owns nothing further, and then any exit
+//// completes it, so an ordinary crash of a leaf cannot manufacture a false
+//// `DrainProofLost` for work that never had descendants.
+////
+//// The scope's own exit reason repeats the verdict outward: it exits
+//// normally only if every drain was proven, and abnormally when any proof
+//// was lost or left unconfirmed. That is what makes scopes compose — an
+//// outer witness monitoring this scope's pid needs no protocol beyond the
+//// one monitors already speak, and a scope used as another run's published
+//// owner propagates a lost proof without either side writing translation
+//// code.
+////
 //// ## Cancellation, and how `Abandoned` stays honest
 ////
 //// A run can be stopped from three directions: `on_failure(CancelSiblings)`
@@ -87,6 +127,33 @@
 //// apart with one boolean: a `Killed` exit *after* the scope initiated
 //// cancellation is `Abandoned`; a `Killed` exit *before* it is
 //// `Crashed(Killed)`, because nobody in this run asked for it.
+////
+//// A managed owner is never killed. Killing it would destroy the one
+//// process whose exit still means something, so cancellation *asks*: the
+//// task's `cancel` closure runs on a disposable helper process, once,
+//// idempotently, and the scope keeps waiting for the owner's own exit. The
+//// helper is disposable for the same reason it exists — a `cancel` closure
+//// that crashes must cost the run a log line, not its witness. By default
+//// that wait is unbounded, because "cancelled" without drain proof is not a
+//// fact this module is willing to invent. `cancel_grace` bounds the wait
+//// for callers that need a bounded teardown: an owner still alive when the
+//// grace expires yields `CancellationUnconfirmed` — cancellation was
+//// requested and nobody proved it landed — and the scope, no longer able to
+//// vouch for the subtree, exits abnormally to say so.
+////
+//// ## Detached runs
+////
+//// `start` and `fold` block their caller, which is right for a function and
+//// wrong for an actor that must keep serving its mailbox. `start_detached`
+//// hands back a handle instead: `pull` collects one outcome at a time (the
+//// same pull-based protocol, so a slow consumer still throttles the run),
+//// `cancel_detached` requests cancellation without discarding the account,
+//// and `scope_pid` names the scope so an outer witness can monitor it — a
+//// normal exit of that pid proves the entire run, owners included, drained.
+//// `start_relayed` is the push adapter for consumers that are actors: a
+//// relay process owns the pulling and forwards each outcome as an ordinary
+//// message, trading the engine's backpressure for the consumer's mailbox,
+//// which is exactly the trade an actor's receive loop already makes.
 ////
 //// ## What the caller may rely on
 ////
@@ -121,12 +188,14 @@
 //// ```
 
 import gleam/bool
+import gleam/erlang/atom
 import gleam/erlang/process.{type ExitReason, type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set
+import weft/internal/sys
 
 // --- The account ------------------------------------------------------------
 
@@ -169,6 +238,30 @@ pub type Outcome(a, e) {
   )
   /// The run ended before this task ever got a slot. No work was done.
   NeverStarted(
+    /// The task's position in the list given to `new`, counting from zero.
+    index: Int,
+  )
+
+  /// A managed task's published owner exited abnormally, so nobody can any
+  /// longer prove whether the task's transitive work stopped. This is not a
+  /// worker crash — the worker's own fate is irrelevant once the proof is
+  /// gone — and it is deliberately distinct from `Crashed`: a caller
+  /// recovering resources must treat "unknown liveness" differently from
+  /// "known death".
+  DrainProofLost(
+    /// The task's position in the list given to `new`, counting from zero.
+    index: Int,
+    /// How the owner exited. `Killed` and `Abnormal` both land here; so does
+    /// an owner that was already dead when the scope went to monitor it,
+    /// because a proof that was never on file was never proof.
+    reason: ExitReason,
+  )
+
+  /// Cancellation was requested, the grace set by `cancel_grace` elapsed,
+  /// and the task's owner was still alive: nobody proved the cancellation
+  /// landed. Only a run with a grace configured can produce this — without
+  /// one the scope waits for the owner's exit however long it takes.
+  CancellationUnconfirmed(
     /// The task's position in the list given to `new`, counting from zero.
     index: Int,
   )
@@ -264,20 +357,139 @@ pub fn cancel(signal: Cancel) -> Nil {
   process.kill(signal.pid)
 }
 
+// --- Prepared tasks ---------------------------------------------------------
+
+/// What a published owner's exit is allowed to prove. Private: the split is
+/// expressed at the API as two constructors, `prepared_task` and
+/// `prepared_leaf`, so a call site names the claim it is making rather than
+/// passing a flag.
+type OwnerRole {
+  /// The owner may have descendants of its own, so only its *normal* exit
+  /// proves the subtree drained; anything else is a lost proof.
+  Transitive
+
+  /// The owner provably owns nothing further. Any exit completes it, which
+  /// is what keeps an ordinary crash of a leaf from manufacturing a false
+  /// `DrainProofLost` for work that never had descendants.
+  Leaf
+}
+
+/// One task, prepared for a run: at minimum a `begin` closure, and for
+/// managed work also the published owner whose exit is the lifecycle truth
+/// for everything the task starts.
+///
+/// Built with `task`, `prepared_task` or `prepared_leaf`, and run with
+/// `new_prepared`. The owner must already be alive when the run starts —
+/// that is the *parked work* pattern: prepare the resource-holding process
+/// first, hand its pid here, and let `begin` release the actual work only
+/// once it runs inside the scope, which is by construction after the scope
+/// has the owner under monitor.
+pub opaque type PreparedTask(a, e) {
+  /// A plain task: worker exit and work stopping are the same fact.
+  PlainTask(begin: fn() -> Result(a, e))
+
+  /// A managed task: the work persists beyond the worker, and `owner`'s
+  /// exit is what settles it.
+  OwnedTask(
+    owner: Pid,
+    cancel: fn() -> Nil,
+    role: OwnerRole,
+    begin: fn() -> Result(a, e),
+  )
+}
+
+/// Prepare a plain task: no owner, no drain obligation, exactly the
+/// behaviour of a closure given to `new`.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new_prepared([weft.task(fn() { Ok(1) })])
+///   |> weft.start
+/// ```
+pub fn task(begin: fn() -> Result(a, e)) -> PreparedTask(a, e) {
+  PlainTask(begin:)
+}
+
+/// Prepare a managed task: work whose lifecycle outlives its worker.
+///
+/// `owner` is the pid whose exit proves the task's transitive work is gone —
+/// only a *normal* exit proves it; any other exit becomes `DrainProofLost`.
+/// `cancel` asks the subtree to stop; it must be safe to call more than once
+/// and safe to call after the work has already finished, and it runs on a
+/// disposable helper so a crash inside it cannot cost the run its witness.
+/// `begin` is the worker's blocking path, and it runs only after the scope
+/// holds the owner under monitor.
+///
+/// The task's slot is held, and its outcome withheld, until both the worker
+/// and the owner have exited. An owner already dead when the run starts
+/// yields `DrainProofLost` without `begin` ever running: proof that was
+/// never on file was never proof.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // `prepare` parks the real request and hands back its owning pid, a
+/// // cancel capability, and the closure that lets it loose.
+/// let #(owner, cancel, begin) = prepare(request)
+///
+/// let outcomes =
+///   weft.new_prepared([weft.prepared_task(owner:, cancel:, begin:)])
+///   |> weft.cancel_grace(2000)
+///   |> weft.start
+/// ```
+pub fn prepared_task(
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+  begin begin: fn() -> Result(a, e),
+) -> PreparedTask(a, e) {
+  OwnedTask(owner:, cancel:, role: Transitive, begin:)
+}
+
+/// Prepare a managed task whose owner provably owns nothing further.
+///
+/// The one difference from `prepared_task`: *any* exit of the owner
+/// completes the drain obligation, normal or not. This is the declared
+/// exemption for single-process owners — an observer, a pump, a relay —
+/// where an ordinary crash is an ordinary crash and must not be read as a
+/// lost proof over descendants that never existed. Everything else — the
+/// monitor-before-begin ordering, the held slot, the `cancel` helper — is
+/// identical.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new_prepared([
+///     weft.prepared_leaf(owner: pump, cancel: stop_pump, begin: run),
+///   ])
+///   |> weft.start
+/// ```
+pub fn prepared_leaf(
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+  begin begin: fn() -> Result(a, e),
+) -> PreparedTask(a, e) {
+  OwnedTask(owner:, cancel:, role: Leaf, begin:)
+}
+
 // --- The builder ------------------------------------------------------------
 
 /// A configured run, not yet started.
 ///
-/// Built with `new` and refined with `limit`, `on_failure`, `cancel_with` and
-/// `deadline`; `start` and `fold` are the terminal verbs. A `Run` is an
-/// ordinary immutable value, so the same one can be started more than once.
+/// Built with `new` or `new_prepared` and refined with `limit`, `on_failure`,
+/// `cancel_with`, `deadline` and `cancel_grace`; `start`, `fold` and
+/// `start_detached` are the terminal verbs. A `Run` is an ordinary immutable
+/// value, so the same one can be started more than once.
 pub opaque type Run(a, e) {
   Run(
-    tasks: List(fn() -> Result(a, e)),
+    tasks: List(PreparedTask(a, e)),
     limit: Int,
     on_failure: OnFailure,
     signal: Option(Cancel),
     within: Option(Int),
+    grace: Option(Int),
   )
 }
 
@@ -301,12 +513,35 @@ pub opaque type Run(a, e) {
 ///   |> weft.start
 /// ```
 pub fn new(tasks: List(fn() -> Result(a, e))) -> Run(a, e) {
+  new_prepared(list.map(tasks, task))
+}
+
+/// Begin a run over prepared tasks, plain and managed mixed freely.
+///
+/// This is `new` for tasks built with `task`, `prepared_task` and
+/// `prepared_leaf`. The defaults are the same: a limit of the schedulers
+/// online, `KeepGoing` on failure, no deadline, and no cancellation grace —
+/// a cancelled managed task is awaited until its owner exits, however long
+/// that takes, unless `cancel_grace` bounds it.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new_prepared([
+///     weft.task(fn() { fetch(url) }),
+///     weft.prepared_task(owner:, cancel:, begin:),
+///   ])
+///   |> weft.start
+/// ```
+pub fn new_prepared(tasks: List(PreparedTask(a, e))) -> Run(a, e) {
   Run(
     tasks:,
     limit: default_limit(),
     on_failure: KeepGoing,
     signal: None,
     within: None,
+    grace: None,
   )
 }
 
@@ -385,6 +620,36 @@ pub fn deadline(run: Run(a, e), within: Int) -> Run(a, e) {
   Run(..run, within: Some(int.max(0, within)))
 }
 
+/// Bound how long a cancellation waits for managed owners to exit, in
+/// milliseconds.
+///
+/// Without a grace, cancelling a managed task means asking its owner to stop
+/// and waiting for the owner's exit however long that takes, because
+/// "cancelled" without drain proof is not a fact this module will invent.
+/// With one, an owner still alive when the grace expires settles as
+/// `CancellationUnconfirmed`, the run finishes bounded — and the scope exits
+/// abnormally, because it can no longer vouch for the subtree it was
+/// witnessing. The grace bounds the *wait*, and what it buys in boundedness
+/// it pays for in the scope's exit verdict.
+///
+/// One grace timer serves the whole cancellation rather than one per task:
+/// it is an acknowledgement window on the teardown, not a per-task timeout,
+/// and it is armed when cancellation begins, from whichever direction it
+/// came.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new_prepared(tasks)
+///   |> weft.deadline(30_000)
+///   |> weft.cancel_grace(2000)
+///   |> weft.start
+/// ```
+pub fn cancel_grace(run: Run(a, e), within: Int) -> Run(a, e) {
+  Run(..run, grace: Some(int.max(0, within)))
+}
+
 // --- Running ----------------------------------------------------------------
 
 /// Run everything to completion and return every outcome in **input** order.
@@ -454,6 +719,8 @@ pub fn start(run: Run(a, e)) -> List(Outcome(a, e)) {
 ///       weft.Completed(..) -> weft.Continue(count + 1)
 ///       weft.Failed(..) | weft.Crashed(..) -> weft.Continue(count)
 ///       weft.Abandoned(..) | weft.NeverStarted(..) -> weft.Continue(count)
+///       weft.DrainProofLost(..) -> weft.Continue(count)
+///       weft.CancellationUnconfirmed(..) -> weft.Continue(count)
 ///     }
 ///   })
 /// ```
@@ -467,6 +734,7 @@ pub fn start(run: Run(a, e)) -> List(Outcome(a, e)) {
 ///       weft.Completed(value:, ..) -> [value, ..found]
 ///       weft.Failed(..) | weft.Crashed(..) -> found
 ///       weft.Abandoned(..) | weft.NeverStarted(..) -> found
+///       weft.DrainProofLost(..) | weft.CancellationUnconfirmed(..) -> found
 ///     }
 ///     case list.length(found) >= 3 {
 ///       True -> weft.Halt(found)
@@ -481,6 +749,269 @@ pub fn fold(
 ) -> acc {
   let #(accumulator, _ending) = drive(run, initial, reducer)
   accumulator
+}
+
+// --- Detached runs ----------------------------------------------------------
+
+/// A handle to a run whose caller declined to block.
+///
+/// Handed back by `start_detached`. The holder collects outcomes with
+/// `pull`, requests cancellation with `cancel_detached`, and — the part a
+/// blocking caller never needs — can hand `scope_pid` to a monitor: the
+/// scope's *normal* exit proves the entire run, managed owners included,
+/// drained, and an abnormal exit says some proof was lost or unconfirmed.
+///
+/// The handle's outbox belongs to the process that called `start_detached`,
+/// so `pull` must be called from that same process. The scope is linked to
+/// that process too: if the holder dies, the scope survives the exit signal
+/// (it traps), cancels what is running, asks every managed owner to stop,
+/// and drains before exiting — a detached run abandoned by its holder tears
+/// itself down rather than leaking.
+pub opaque type Detached(a, e) {
+  Detached(
+    /// The scope process, for outer witnesses to monitor.
+    scope: Pid,
+    /// Where demand and cancellation are sent.
+    inbox: Subject(Request),
+    /// Where the scope's replies land. Owned by the starting process.
+    outbox: Subject(Reply(a, e)),
+  )
+}
+
+/// What one `pull` produced.
+pub type Pulled(a, e) {
+  /// One task's outcome, in completion order.
+  PulledOutcome(
+    /// The outcome pulled.
+    outcome: Outcome(a, e),
+  )
+
+  /// Every outcome has been delivered; the run is over and nothing it
+  /// started is alive. Stop pulling: there is nothing left to pull, and a
+  /// later `pull` will report the scope's exit as `RunLost` rather than
+  /// repeating this answer.
+  AllDelivered
+
+  /// Nothing landed within the wait. The demand stands — the scope holds at
+  /// most one granted delivery, so pulling again neither loses nor
+  /// duplicates an outcome.
+  NotYet
+
+  /// The scope died without saying `Done`: either something outside the run
+  /// destroyed it, or its final exit carried the drain verdict for a run
+  /// whose account was already delivered.
+  RunLost(
+    /// How the scope exited.
+    reason: ExitReason,
+  )
+}
+
+/// Start a run without blocking, and hand back its handle.
+///
+/// The run is the same in every respect — same scope, same account, same
+/// ownership guarantees — only the consumption differs: nothing is
+/// delivered until the holder asks with `pull`, so the run's backpressure
+/// now reaches whatever pace the holder pulls at.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let detached =
+///   weft.new_prepared(tasks)
+///   |> weft.cancel_grace(2000)
+///   |> weft.start_detached
+///
+/// let watch = process.monitor(weft.scope_pid(detached))
+/// // ... pull outcomes as the mood takes you ...
+/// ```
+pub fn start_detached(run: Run(a, e)) -> Detached(a, e) {
+  let outbox = process.new_subject()
+  let caller = process.self()
+  let scope = process.spawn(fn() { run_scope(caller, outbox, run, Busy) })
+
+  // The scope's first word is `Ready`, sent before its loop begins, so this
+  // receive is a handshake rather than a wait on work. The monitor covers
+  // the one way the handshake can fail — the scope dying first — and a dead
+  // scope still yields a usable handle: its inbox goes nowhere, and every
+  // `pull` reports `RunLost`.
+  let watch = process.monitor(scope)
+  let hello =
+    process.new_selector()
+    |> process.select_map(outbox, FromScope)
+    |> process.select_specific_monitor(watch, scope_down)
+  let inbox = await_ready(hello)
+  process.demonitor_process(watch)
+
+  Detached(scope:, inbox:, outbox:)
+}
+
+/// Wait for the scope's `Ready`, or fabricate an inbox if it died first.
+fn await_ready(hello: process.Selector(CallerEvent(a, e))) -> Subject(Request) {
+  case process.selector_receive_forever(hello) {
+    FromScope(Ready(inbox:)) -> inbox
+    ScopeDown(..) -> process.new_subject()
+
+    // `Ready` precedes every delivery by construction; these arms are
+    // totality, not races we have seen.
+    FromScope(Delivered(inbox:, ..)) -> inbox
+    FromScope(Done) -> process.new_subject()
+  }
+}
+
+/// Collect one outcome from a detached run, waiting at most `within`
+/// milliseconds.
+///
+/// Must be called from the process that called `start_detached` — the
+/// handle's outbox belongs to it. Demand is unary and idempotent: a `pull`
+/// that times out leaves its demand standing, and the next `pull` re-grants
+/// it harmlessly, so at most one outcome is ever in flight and none is ever
+/// dropped or doubled.
+///
+/// ## Examples
+///
+/// ```gleam
+/// case weft.pull(detached, within: 1000) {
+///   weft.PulledOutcome(outcome) -> act_on(outcome)
+///   weft.NotYet -> check_something_else()
+///   weft.AllDelivered -> done()
+///   weft.RunLost(reason) -> escalate(reason)
+/// }
+/// ```
+pub fn pull(detached: Detached(a, e), within timeout: Int) -> Pulled(a, e) {
+  process.send(detached.inbox, Next)
+
+  // The monitor is per-pull rather than per-handle so that `pull` stays
+  // callable after any answer: demonitoring flushes, so no stale `DOWN`
+  // survives into the holder's later receives.
+  let watch = process.monitor(detached.scope)
+  let events =
+    process.new_selector()
+    |> process.select_map(detached.outbox, FromScope)
+    |> process.select_specific_monitor(watch, scope_down)
+
+  let pulled = await_pull(events, timeout)
+  process.demonitor_process(watch)
+  pulled
+}
+
+/// One pull's receive. `Ready` is the handshake echo a first pull can still
+/// find in the mailbox; it is consumed and the wait continues.
+fn await_pull(
+  events: process.Selector(CallerEvent(a, e)),
+  timeout: Int,
+) -> Pulled(a, e) {
+  case process.selector_receive(events, timeout) {
+    Ok(FromScope(Delivered(outcome:, ..))) -> PulledOutcome(outcome:)
+    Ok(FromScope(Done)) -> AllDelivered
+    Ok(FromScope(Ready(..))) -> await_pull(events, timeout)
+    Ok(ScopeDown(reason: process.Normal)) -> AllDelivered
+    Ok(ScopeDown(reason:)) -> RunLost(reason:)
+    Error(Nil) -> NotYet
+  }
+}
+
+/// Cancel a detached run without giving up its account.
+///
+/// Unlike a `fold` reducer's `Halt`, which discards what it has not seen,
+/// this keeps the deliveries coming: running tasks settle as `Abandoned`,
+/// unstarted ones as `NeverStarted`, and managed tasks by whatever their
+/// owners' exits prove. Idempotent — cancelling a cancelled or finished run
+/// does nothing.
+///
+/// ## Examples
+///
+/// ```gleam
+/// weft.cancel_detached(detached)
+/// // ... keep pulling until AllDelivered ...
+/// ```
+pub fn cancel_detached(detached: Detached(a, e)) -> Nil {
+  process.send(detached.inbox, CancelRun)
+}
+
+/// The scope process behind a detached run.
+///
+/// This is the pid an outer witness monitors, and the pid a *nested* run
+/// publishes as its owner: a detached run handed to `prepared_task` as
+/// `owner: weft.scope_pid(inner)` composes ownership — the outer scope's
+/// proof for that task is the inner scope's own drain verdict, with no
+/// translation code on either side.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let inner = weft.new_prepared(children) |> weft.start_detached
+///
+/// let outer_task =
+///   weft.prepared_task(
+///     owner: weft.scope_pid(inner),
+///     cancel: fn() { weft.cancel_detached(inner) },
+///     begin: fn() { collect(inner) },
+///   )
+/// ```
+pub fn scope_pid(detached: Detached(a, e)) -> Pid {
+  detached.scope
+}
+
+/// Start a run and push every outcome to `sink` as an ordinary message,
+/// from a relay process this function spawns and returns.
+///
+/// This is the adapter for consumers that are actors: an actor must not
+/// block its receive loop inside `pull`, so the relay owns the pulling and
+/// the actor merely receives. Each outcome arrives as `PulledOutcome`,
+/// followed by exactly one `AllDelivered` or `RunLost`, after which the
+/// relay exits normally.
+///
+/// What is traded away is stated plainly: push delivery makes the sink's
+/// mailbox the buffer, so the engine's backpressure ends at the relay. That
+/// is the same trade every actor's mailbox already makes, and the `limit`
+/// still bounds how much work runs at once — only the finished outcomes
+/// queue without bound.
+///
+/// The relay is linked to the caller, and the scope to the relay, so the
+/// ownership chain survives: a dead consumer takes the relay with it, the
+/// scope traps that exit, cancels, drains its owners, and exits.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let relay =
+///   weft.new_prepared(tasks)
+///   |> weft.start_relayed(to: sink)
+/// // The actor's selector now receives weft.Pulled(a, e) messages.
+/// ```
+pub fn start_relayed(run: Run(a, e), to sink: Subject(Pulled(a, e))) -> Pid {
+  process.spawn(fn() {
+    let detached = start_detached(run)
+
+    // The relay grants demand once, then re-grants it after every delivery:
+    // the pull protocol unchanged, with the relay standing where a blocked
+    // caller would.
+    let watch = process.monitor(detached.scope)
+    let events =
+      process.new_selector()
+      |> process.select_map(detached.outbox, FromScope)
+      |> process.select_specific_monitor(watch, scope_down)
+    relay_outcomes(detached, events, sink)
+  })
+}
+
+/// The relay's loop: forward until the run says it is over, then stop.
+fn relay_outcomes(
+  detached: Detached(a, e),
+  events: process.Selector(CallerEvent(a, e)),
+  sink: Subject(Pulled(a, e)),
+) -> Nil {
+  process.send(detached.inbox, Next)
+  case process.selector_receive_forever(events) {
+    FromScope(Delivered(outcome:, ..)) -> {
+      process.send(sink, PulledOutcome(outcome:))
+      relay_outcomes(detached, events, sink)
+    }
+    FromScope(Ready(..)) -> relay_outcomes(detached, events, sink)
+    FromScope(Done) -> process.send(sink, AllDelivered)
+    ScopeDown(reason: process.Normal) -> process.send(sink, AllDelivered)
+    ScopeDown(reason:) -> process.send(sink, RunLost(reason:))
+  }
 }
 
 // --- Sugar ------------------------------------------------------------------
@@ -592,6 +1123,8 @@ pub fn first_ok(
         Crashed(..) -> Continue(account)
         Abandoned(..) -> Continue(account)
         NeverStarted(..) -> Continue(account)
+        DrainProofLost(..) -> Continue(account)
+        CancellationUnconfirmed(..) -> Continue(account)
       }
     })
 
@@ -606,6 +1139,8 @@ pub fn first_ok(
       Crashed(..) -> Error(Nil)
       Abandoned(..) -> Error(Nil)
       NeverStarted(..) -> Error(Nil)
+      DrainProofLost(..) -> Error(Nil)
+      CancellationUnconfirmed(..) -> Error(Nil)
     }
   })
   |> result.map_error(fn(_) { by_index(account) })
@@ -638,6 +1173,8 @@ pub fn partition(
         Crashed(..) -> #(succeeded, [outcome, ..rest])
         Abandoned(..) -> #(succeeded, [outcome, ..rest])
         NeverStarted(..) -> #(succeeded, [outcome, ..rest])
+        DrainProofLost(..) -> #(succeeded, [outcome, ..rest])
+        CancellationUnconfirmed(..) -> #(succeeded, [outcome, ..rest])
       }
     })
   #(list.reverse(succeeded), list.reverse(rest))
@@ -659,6 +1196,8 @@ pub fn values(outcomes: List(Outcome(a, e))) -> List(a) {
       Crashed(..) -> Error(Nil)
       Abandoned(..) -> Error(Nil)
       NeverStarted(..) -> Error(Nil)
+      DrainProofLost(..) -> Error(Nil)
+      CancellationUnconfirmed(..) -> Error(Nil)
     }
   })
 }
@@ -683,6 +1222,8 @@ pub fn failures(outcomes: List(Outcome(a, e))) -> List(e) {
       Crashed(..) -> Error(Nil)
       Abandoned(..) -> Error(Nil)
       NeverStarted(..) -> Error(Nil)
+      DrainProofLost(..) -> Error(Nil)
+      CancellationUnconfirmed(..) -> Error(Nil)
     }
   })
 }
@@ -699,17 +1240,33 @@ pub fn failures(outcomes: List(Outcome(a, e))) -> List(e) {
 /// which is what removes the need for a separate handshake message: the caller
 /// cannot reply before it has been spoken to, and it never needs to.
 type Reply(a, e) {
+  /// The scope's first word, sent before anything else: here is the inbox.
+  /// A blocking caller ignores it — `Delivered` re-carries the inbox anyway —
+  /// but a detached caller needs the inbox *before* the first delivery, to
+  /// have somewhere to send demand and cancellation.
+  Ready(inbox: Subject(Request))
+
   Delivered(inbox: Subject(Request), outcome: Outcome(a, e))
+
   Done
 }
 
-/// What the caller says back. One of these follows every `Delivered`, and
-/// nothing else is ever sent.
+/// What the caller says back. Nothing else is ever sent.
 type Request {
   /// The outcome has been consumed; send the next one when there is one.
+  /// Demand is unary, not counted: a `Next` while the scope is already
+  /// allowed to deliver is a no-op, which is what lets a detached puller
+  /// re-grant demand it cannot remember granting without ever doubling a
+  /// delivery.
   Next
+
   /// The reducer halted. Cancel the rest and tell me when the teardown is done.
   Stop
+
+  /// Cancel the run, but keep delivering the account. This is the detached
+  /// handle's cancellation: unlike `Stop`, the caller still wants to hear
+  /// what happened to every task.
+  CancelRun
 }
 
 /// What the caller's receive can produce. The monitor arm exists so that a
@@ -731,18 +1288,15 @@ fn drive(
   initial: acc,
   reducer: fn(acc, Outcome(a, e)) -> Step(acc),
 ) -> #(acc, Option(ExitReason)) {
-  let Run(tasks:, limit:, on_failure:, signal:, within:) = run
-  let indexed = list.index_map(tasks, fn(task, index) { #(index, task) })
   let outbox = process.new_subject()
   let caller = process.self()
 
   // proc_lib:spawn_link, so the link is in place before the scope runs its
   // first instruction. A caller that dies during the handshake is therefore
-  // still a caller the scope will hear about.
-  let scope =
-    process.spawn(fn() {
-      run_scope(caller, outbox, indexed, limit, on_failure, signal, within)
-    })
+  // still a caller the scope will hear about. A blocking caller counts as
+  // one unit of demand already granted, because it is about to sit in
+  // `consume` with nothing else to do.
+  let scope = process.spawn(fn() { run_scope(caller, outbox, run, Waiting) })
 
   let watch = process.monitor(scope)
   let replies =
@@ -774,6 +1328,11 @@ fn consume(
   case process.selector_receive_forever(replies) {
     ScopeDown(reason:) -> #(accumulator, Some(reason))
     FromScope(Done) -> #(accumulator, None)
+
+    // The hello matters only to a detached caller; a blocking one gets the
+    // inbox with every delivery.
+    FromScope(Ready(..)) -> consume(replies, accumulator, reducer)
+
     FromScope(Delivered(inbox:, outcome:)) ->
       case reducer(accumulator, outcome) {
         Continue(accumulator:) -> {
@@ -803,6 +1362,7 @@ fn await_done(
   case process.selector_receive_forever(replies) {
     ScopeDown(reason:) -> Some(reason)
     FromScope(Done) -> None
+    FromScope(Ready(..)) -> await_done(replies)
     // The scope only delivers against outstanding demand and we withdrew ours
     // with `Stop`, so this arm is here for totality rather than for a race we
     // have seen. Dropping the outcome is right: the reducer said it was done.
@@ -823,10 +1383,87 @@ type Report(a, e) {
 /// is one flat dispatch rather than a stack of selective receives.
 type Event(a, e) {
   Reported(report: Report(a, e))
+
   Exited(pid: Pid, reason: ExitReason)
+
   Asked(request: Request)
+
   DeadlinePassed
-  SignalLost
+
+  /// The cancellation grace ran out with owners still unaccounted for.
+  GracePassed
+
+  /// A monitored process died: the cancel signal or a managed owner. Which
+  /// one is the dispatch's problem — the selector only knows it was watched.
+  WatchedDown(pid: Pid, reason: ExitReason)
+
+  /// A monitored *port* died. The scope never monitors ports, so this is
+  /// totality for the generic monitor arm, not an event with a meaning.
+  PortWatched
+
+  /// Something arrived on the OTP system plane: `sys:get_state/1`,
+  /// `sys:suspend/1` and their kin. Answering these is what makes a scope
+  /// visible to the observer and freezable like any other OTP process.
+  System(incoming: sys.Incoming)
+}
+
+/// Which fact a managed owner's exit has established so far.
+type Proof {
+  /// The owner is still alive; the task's outcome is withheld.
+  ProofPending
+
+  /// The owner was already dead when the scope went to adopt it. Its
+  /// `noproc` `DOWN` is queued and will settle the task as lost whatever
+  /// role it was declared with: a leaf that was gone before `begin` could
+  /// run proved nothing about work that never started, and its task must
+  /// still appear in the account.
+  ProofAbsent
+
+  /// The owner's exit proved the subtree drained. The task's own outcome
+  /// stands.
+  ProofDrained
+
+  /// The owner exited without proving anything: the task settles as
+  /// `DrainProofLost`, whatever its worker did.
+  ProofLost(reason: ExitReason)
+
+  /// The cancellation grace expired with the owner alive: the task settles
+  /// as `CancellationUnconfirmed`.
+  ProofUnconfirmed
+}
+
+/// One managed owner under watch, from the moment the scope starts to the
+/// moment its proof resolves.
+type OwnerSlot {
+  OwnerSlot(
+    /// The task this owner vouches for.
+    index: Int,
+    /// The owner process itself. Never killed by this scope: its exit is
+    /// the one fact cancellation is waiting to learn.
+    pid: Pid,
+    /// The monitor watching it, kept so a grace expiry can demonitor with a
+    /// flush rather than leave a stale `DOWN` for the loop to misread.
+    monitor: process.Monitor,
+    /// What this owner's exit is allowed to prove.
+    role: OwnerRole,
+    /// The idempotent ask-to-stop capability, run on a disposable helper.
+    cancel: fn() -> Nil,
+    /// Where the proof stands.
+    proof: Proof,
+    /// The helper running `cancel`, once cancellation has dispatched it.
+    canceller: Option(Pid),
+  )
+}
+
+/// The run-wide drain verdict, carried out of the scope as its exit reason.
+/// Strictly ordered: a lost proof outranks an unconfirmed cancellation,
+/// which outranks a clean drain, and `worsen` only ever moves up.
+type Verdict {
+  AllDrained
+
+  SomeUnconfirmed
+
+  SomeLost
 }
 
 /// Where the caller is in the conversation. This is a four-state machine rather
@@ -859,9 +1496,15 @@ type Scope(a, e) {
     inbox: Subject(Request),
     reports: Subject(Report(a, e)),
     alarm: Subject(Nil),
+    grace_alarm: Subject(Nil),
     events: process.Selector(Event(a, e)),
+    /// The suspended-mode selector: the system plane and nothing else, so a
+    /// frozen scope stays frozen while `sys` can still reach it.
+    sys_events: process.Selector(Event(a, e)),
     on_failure: OnFailure,
     timer: Option(process.Timer),
+    grace: Option(Int),
+    grace_timer: Option(process.Timer),
     /// Tasks that have not been spawned, in input order.
     pending: List(#(Int, fn() -> Result(a, e))),
     /// Spawned and unaccounted, keyed by pid because that is what an `EXIT`
@@ -871,11 +1514,29 @@ type Scope(a, e) {
     finishing: List(Pid),
     /// Outcomes waiting for the consumer to ask, in completion order.
     ready: Backlog(a, e),
+    /// Worker-settled outcomes withheld because their owner's proof is
+    /// still pending, keyed by task index.
+    awaiting: List(#(Int, Outcome(a, e))),
+    /// Every managed owner, resolved and not. Consulted at settle time for
+    /// each outcome, and by `settled` for whether the run may end.
+    owners: List(OwnerSlot),
+    /// Disposable helpers running `cancel` closures. Their exits are
+    /// bookkeeping, not outcomes, but the scope will not return while one
+    /// is alive.
+    helpers: List(Pid),
+    /// The cancel signal's pid, so its `DOWN` can be told apart from an
+    /// owner's.
+    signal_pid: Option(Pid),
     /// Free slots. Taken at spawn, returned at delivery. Not consulted once
     /// `cancelling` is `True`, since nothing new is spawned after that.
     slots: Int,
     consumer: Consumer,
     cancelling: Bool,
+    /// The drain verdict so far. Only ever worsens, and leaves this process
+    /// as its exit reason.
+    verdict: Verdict,
+    /// The OTP debug plane: suspend/resume mode and what `sys` reports.
+    plane: sys.Plane,
   )
 }
 
@@ -883,35 +1544,57 @@ type Scope(a, e) {
 fn run_scope(
   caller: Pid,
   outbox: Subject(Reply(a, e)),
-  tasks: List(#(Int, fn() -> Result(a, e))),
-  limit: Int,
-  on_failure: OnFailure,
-  signal: Option(Cancel),
-  within: Option(Int),
+  run: Run(a, e),
+  consumer: Consumer,
 ) -> Nil {
   // Trapping first is what turns a worker crash into a `Crashed` outcome
   // instead of a dead scope, and what turns the caller's death into an event
   // this process can act on rather than a signal that kills it mid-teardown.
   process.trap_exits(True)
 
+  let Run(tasks:, limit:, on_failure:, signal:, within:, grace:) = run
+  let indexed =
+    list.index_map(tasks, fn(prepared, index) { #(index, prepared) })
+
   let inbox = process.new_subject()
   let reports = process.new_subject()
   let alarm = process.new_subject()
+  let grace_alarm = process.new_subject()
+
+  // The hello precedes everything, deliveries included: a detached caller
+  // has no other way to learn where demand and cancellation are sent.
+  process.send(outbox, Ready(inbox:))
 
   let timer = case within {
     None -> None
     Some(milliseconds) -> Some(process.send_after(alarm, milliseconds, Nil))
   }
 
+  // The system arm is merged last so nothing the run selects can shadow it;
+  // a scope that stopped answering `sys` would hang the very tool reaching
+  // for it.
   let events =
     process.new_selector()
     |> process.select_map(reports, Reported)
     |> process.select_map(inbox, Asked)
     |> process.select_map(alarm, fn(_) { DeadlinePassed })
+    |> process.select_map(grace_alarm, fn(_) { GracePassed })
     |> process.select_trapped_exits(fn(exit: process.ExitMessage) {
       Exited(pid: exit.pid, reason: exit.reason)
     })
-    |> process.select_monitors(fn(_) { SignalLost })
+    |> process.select_monitors(watched_down)
+    |> sys.selecting(System)
+
+  let sys_events =
+    process.new_selector()
+    |> sys.selecting(System)
+
+  // Owners before workers, unconditionally: adopting every owner here, ahead
+  // of the first `fill_slots`, is what makes "the scope holds ownership
+  // evidence before `begin` runs" true by construction rather than by
+  // handshake. An owner that is already dead queues its `DOWN` immediately,
+  // so the ordinary dispatch catches it before its task's worker can spawn.
+  let #(owners, pending) = adopt_owners(indexed)
 
   let scope =
     Scope(
@@ -920,21 +1603,86 @@ fn run_scope(
       inbox:,
       reports:,
       alarm:,
+      grace_alarm:,
       events:,
+      sys_events:,
       on_failure:,
       timer:,
-      pending: tasks,
+      grace:,
+      grace_timer: None,
+      pending:,
       running: [],
       finishing: [],
       ready: new_backlog(),
+      awaiting: [],
+      owners:,
+      helpers: [],
+      signal_pid: None,
       slots: limit,
-      // The caller is blocked on its first receive before this process runs at
-      // all, so the run starts with one unit of demand already granted.
-      consumer: Waiting,
+      consumer:,
       cancelling: False,
+      verdict: AllDrained,
+      plane: sys.new(module: "weft", parent: caller),
     )
 
   loop(watch_signal(scope, signal))
+}
+
+/// Split prepared tasks into the owner ledger and the spawn queue, taking
+/// out a monitor on every owner as it passes.
+fn adopt_owners(
+  tasks: List(#(Int, PreparedTask(a, e))),
+) -> #(List(OwnerSlot), List(#(Int, fn() -> Result(a, e)))) {
+  let #(owners, pending) =
+    list.fold(tasks, #([], []), fn(split, entry) {
+      let #(owners, pending) = split
+      let #(index, prepared) = entry
+
+      case prepared {
+        PlainTask(begin:) -> #(owners, [#(index, begin), ..pending])
+
+        OwnedTask(owner:, cancel:, role:, begin:) -> {
+          let monitor = process.monitor(owner)
+
+          // The `DOWN` for an already-dead owner is queued by the monitor
+          // call, but `fill_slots` runs before the scope's first receive, so
+          // the message alone arrives too late to stop the spawn. This
+          // liveness check is what actually holds `begin` back; the queued
+          // `DOWN` then resolves the proof — carrying the real reason —
+          // through the ordinary dispatch. The monitor still covers an
+          // owner that dies between these two lines. Absence is recorded on
+          // the slot as well, because a task whose worker never spawns has
+          // no exit of its own to settle it: the `DOWN` must settle it as
+          // lost even for a leaf, or the account would come up one short.
+          let #(proof, pending) = case process.is_alive(owner) {
+            True -> #(ProofPending, [#(index, begin), ..pending])
+            False -> #(ProofAbsent, pending)
+          }
+          let slot =
+            OwnerSlot(
+              index:,
+              pid: owner,
+              monitor:,
+              role:,
+              cancel:,
+              proof:,
+              canceller: None,
+            )
+          #([slot, ..owners], pending)
+        }
+      }
+    })
+
+  #(owners, list.reverse(pending))
+}
+
+/// Sort a generic monitor `DOWN` into the event vocabulary. Ports are
+/// unreachable — the scope never monitors one — but the type owns them.
+fn watched_down(down: process.Down) -> Event(a, e) {
+  case down {
+    process.ProcessDown(pid:, reason:, ..) -> WatchedDown(pid:, reason:)
+    process.PortDown(..) -> PortWatched
+  }
 }
 
 /// Watch the cancel signal, and settle the one question the monitor alone
@@ -953,6 +1701,8 @@ fn watch_signal(scope: Scope(a, e), signal: Option(Cancel)) -> Scope(a, e) {
     None -> scope
     Some(Cancel(pid:)) -> {
       let _watch = process.monitor(pid)
+
+      let scope = Scope(..scope, signal_pid: Some(pid))
       case process.is_alive(pid) {
         True -> scope
         False -> begin_cancel(scope)
@@ -964,6 +1714,13 @@ fn watch_signal(scope: Scope(a, e), signal: Option(Cancel)) -> Scope(a, e) {
 /// Do everything that needs no message, then decide whether there is anything
 /// left to wait for.
 fn loop(scope: Scope(a, e)) -> Nil {
+  // A suspended scope serves the system plane and nothing else: run events
+  // queue in the mailbox until `sys:resume/1`, which is the promise
+  // `sys:suspend/1` made on this process's behalf.
+  use <- bool.lazy_guard(when: sys.is_suspended(scope.plane), return: fn() {
+    loop(step(scope, process.selector_receive_forever(scope.sys_events)))
+  })
+
   let scope = deliver(fill_slots(scope))
   case settled(scope) {
     True -> finish(scope)
@@ -971,16 +1728,34 @@ fn loop(scope: Scope(a, e)) -> Nil {
   }
 }
 
-/// Is there any work, any unreaped worker, or any undelivered outcome left?
+/// Is there any work, any unreaped worker, any undelivered outcome, any
+/// unresolved owner, or any live helper left?
 ///
 /// The `finishing` clause is the one that is easy to drop and expensive to lose:
 /// without it the scope could return while a worker that had already answered
-/// was still alive, which is exactly the guarantee this module sells.
+/// was still alive, which is exactly the guarantee this module sells. The
+/// owner and helper clauses extend the same guarantee to managed work: a
+/// scope that returned while an owner's proof was pending would be a witness
+/// that walked out mid-testimony.
 fn settled(scope: Scope(a, e)) -> Bool {
   list.is_empty(scope.pending)
   && list.is_empty(scope.running)
   && list.is_empty(scope.finishing)
   && backlog_is_empty(scope.ready)
+  && list.is_empty(scope.awaiting)
+  && list.is_empty(scope.helpers)
+  && list.all(scope.owners, owner_resolved)
+}
+
+/// Has this owner's exit — or the grace — said what it is going to say?
+fn owner_resolved(slot: OwnerSlot) -> Bool {
+  case slot.proof {
+    ProofPending -> False
+    ProofAbsent -> False
+    ProofDrained -> True
+    ProofLost(..) -> True
+    ProofUnconfirmed -> True
+  }
 }
 
 /// Spawn into every free slot, in input order, until the bound or the queue
@@ -1044,14 +1819,251 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
   case event {
     Reported(report:) -> note_report(scope, report)
     Exited(pid:, reason:) -> note_exit(scope, pid, reason)
-    Asked(request: Next) -> Scope(..scope, consumer: Waiting)
+    Asked(request: Next) ->
+      Scope(..scope, consumer: note_demand(scope.consumer))
     Asked(request: Stop) -> detach(scope, Halted)
+    Asked(request: CancelRun) -> begin_cancel(scope)
+
     // Clearing the timer here is half of the flush: a timer that has fired
     // cannot be cancelled, and `flush_deadline` must not go looking for a
     // message this branch already consumed.
     DeadlinePassed -> begin_cancel(Scope(..scope, timer: None))
-    SignalLost -> begin_cancel(scope)
+    GracePassed -> expire_grace(Scope(..scope, grace_timer: None))
+    WatchedDown(pid:, reason:) -> note_watched_down(scope, pid, reason)
+    PortWatched -> scope
+
+    // The reply to a system request is sent from inside `handle`, before the
+    // loop can touch another message; only the mode comes back.
+    System(incoming: sys.Request(message:)) ->
+      Scope(..scope, plane: sys.handle(scope.plane, message, holding: scope))
+    System(incoming: sys.Unimplemented(..)) -> {
+      sys.warn("weft scope ignoring an unimplemented system request")
+      scope
+    }
   }
+}
+
+/// Grant one unit of demand, if there is still anyone to deliver to.
+///
+/// Demand is unary rather than counted, which is what makes a detached
+/// puller's re-sent `Next` a no-op instead of a doubled delivery. A halted
+/// or dead consumer stays halted or dead: a late `Next` from a mailbox race
+/// must not reopen delivery.
+fn note_demand(consumer: Consumer) -> Consumer {
+  case consumer {
+    Waiting -> Waiting
+    Busy -> Waiting
+    Halted -> Halted
+    Gone -> Gone
+  }
+}
+
+/// A watched process died: the cancel signal, or a managed owner.
+fn note_watched_down(
+  scope: Scope(a, e),
+  pid: Pid,
+  reason: ExitReason,
+) -> Scope(a, e) {
+  use <- bool.lazy_guard(when: Some(pid) == scope.signal_pid, return: fn() {
+    begin_cancel(scope)
+  })
+  resolve_owner(scope, pid, reason)
+}
+
+/// An owner has exited; record what that proves and act on it.
+fn resolve_owner(
+  scope: Scope(a, e),
+  pid: Pid,
+  reason: ExitReason,
+) -> Scope(a, e) {
+  case find_owner(scope.owners, pid) {
+    // A `DOWN` with no slot is a flushed monitor's leftover or somebody
+    // else's monitor traffic; there is nothing of ours in it.
+    Error(Nil) -> scope
+
+    Ok(slot) -> {
+      // The canceller's job ended with the owner, however the owner went.
+      // Dismissed off the slot as found, before the slot is rewritten
+      // without it — a helper whose `cancel` blocks would otherwise hold
+      // the scope open after the very exit it was asking for.
+      dismiss_canceller(slot.canceller)
+
+      let proof = judge_exit(slot, reason)
+      let slot = OwnerSlot(..slot, proof:, canceller: None)
+
+      let scope =
+        Scope(
+          ..scope,
+          owners: put_owner(scope.owners, slot),
+          verdict: worsen_for(scope.verdict, proof),
+        )
+      apply_proof(scope, slot)
+    }
+  }
+}
+
+/// What one exit reason proves, given what the owner was declared to be
+/// and whether it was ever alive under watch.
+///
+/// The full matrix is spelled out because the corner that matters hides in
+/// it: a `noproc` `DOWN` — the owner was dead before the scope could watch
+/// it — arrives as an abnormal reason, and that is a lost proof whatever
+/// the role, because a leaf exemption covers an ordinary crash of work
+/// that ran, not an owner that was a corpse before `begin` was admitted.
+/// Proof that was never on file was never proof. For an owner that was
+/// alive at adoption, the role decides: any exit completes a leaf, and
+/// only a normal exit proves a transitive subtree drained.
+fn judge_exit(slot: OwnerSlot, reason: ExitReason) -> Proof {
+  case slot.proof {
+    ProofAbsent -> ProofLost(reason:)
+    ProofPending -> judge_role(slot.role, reason)
+
+    // A monitor fires once, so a resolved slot never sees a second exit;
+    // the role still answers, for totality.
+    ProofDrained -> judge_role(slot.role, reason)
+    ProofLost(..) -> judge_role(slot.role, reason)
+    ProofUnconfirmed -> judge_role(slot.role, reason)
+  }
+}
+
+/// The role's half of the judgement, for an owner that was alive under
+/// watch.
+fn judge_role(role: OwnerRole, reason: ExitReason) -> Proof {
+  case role, reason {
+    Leaf, process.Normal -> ProofDrained
+    Leaf, process.Killed -> ProofDrained
+    Leaf, process.Abnormal(..) -> ProofDrained
+    Transitive, process.Normal -> ProofDrained
+    Transitive, process.Killed -> ProofLost(reason:)
+    Transitive, process.Abnormal(..) -> ProofLost(reason:)
+  }
+}
+
+/// Fold one owner's proof into the run-wide verdict.
+fn worsen_for(verdict: Verdict, proof: Proof) -> Verdict {
+  case proof {
+    ProofLost(..) -> SomeLost
+    ProofUnconfirmed -> worsen_to_unconfirmed(verdict)
+    ProofPending -> verdict
+    ProofAbsent -> verdict
+    ProofDrained -> verdict
+  }
+}
+
+/// Unconfirmed never downgrades a lost proof.
+fn worsen_to_unconfirmed(verdict: Verdict) -> Verdict {
+  case verdict {
+    SomeLost -> SomeLost
+    SomeUnconfirmed -> SomeUnconfirmed
+    AllDrained -> SomeUnconfirmed
+  }
+}
+
+/// Act on a freshly resolved proof: release a withheld outcome, or reach
+/// forward into work that has not settled yet.
+fn apply_proof(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
+  case list.key_pop(scope.awaiting, slot.index) {
+    // The worker already settled and its outcome was withheld on this very
+    // proof; seal and queue it.
+    Ok(#(outcome, awaiting)) ->
+      queue_outcome(
+        Scope(..scope, awaiting:),
+        seal_outcome(outcome, slot.proof),
+      )
+
+    Error(Nil) -> reach_forward(scope, slot)
+  }
+}
+
+/// A proof resolved before the worker settled. A drained proof asks for
+/// nothing — the worker's own settle will read it. A lost one reaches
+/// forward: an unstarted `begin` must never run under a dead witness, and a
+/// running worker's continued work is unsupervisable, so it is killed and
+/// its exit settles through the ordinary path.
+fn reach_forward(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
+  case slot.proof {
+    ProofLost(reason:) ->
+      case list.key_pop(scope.pending, slot.index) {
+        Ok(#(_begin, pending)) ->
+          queue_outcome(
+            Scope(..scope, pending:),
+            DrainProofLost(index: slot.index, reason:),
+          )
+        Error(Nil) -> settle_lost_worker(scope, slot.index, reason)
+      }
+
+    ProofPending -> scope
+    ProofAbsent -> scope
+    ProofDrained -> scope
+    ProofUnconfirmed -> scope
+  }
+}
+
+/// A proof was lost for a task that is neither pending nor withheld. A
+/// running worker is killed — its work is unsupervisable under a dead
+/// witness — and its `EXIT` settles through `note_exit`, where the seal
+/// turns whatever that classifies into `DrainProofLost`. A task with no
+/// worker at all — its owner was already dead at adoption, so `begin` was
+/// never allowed to spawn — settles here directly, because no exit is ever
+/// going to arrive on its behalf.
+fn settle_lost_worker(
+  scope: Scope(a, e),
+  index: Int,
+  reason: ExitReason,
+) -> Scope(a, e) {
+  let killed =
+    list.find(scope.running, fn(slot) {
+      let #(_pid, running_index) = slot
+      running_index == index
+    })
+  case killed {
+    Ok(#(pid, _index)) -> {
+      process.kill(pid)
+      scope
+    }
+    Error(Nil) -> queue_outcome(scope, DrainProofLost(index:, reason:))
+  }
+}
+
+/// End a canceller whose question has been answered.
+fn dismiss_canceller(canceller: Option(Pid)) -> Nil {
+  case canceller {
+    None -> Nil
+    Some(pid) -> process.kill(pid)
+  }
+}
+
+/// The grace ran out. Every owner still pending settles as unconfirmed: its
+/// monitor is flushed away, its canceller dismissed, and any withheld
+/// outcome released as `CancellationUnconfirmed`. An owner whose `DOWN` was
+/// already in the mailbox was resolved before this event — mailbox order —
+/// so only genuinely silent owners land here.
+fn expire_grace(scope: Scope(a, e)) -> Scope(a, e) {
+  list.fold(scope.owners, scope, fn(scope, slot) {
+    case slot.proof {
+      ProofPending -> {
+        process.demonitor_process(slot.monitor)
+        dismiss_canceller(slot.canceller)
+
+        let slot = OwnerSlot(..slot, proof: ProofUnconfirmed, canceller: None)
+        let scope =
+          Scope(
+            ..scope,
+            owners: put_owner(scope.owners, slot),
+            verdict: worsen_for(scope.verdict, ProofUnconfirmed),
+          )
+        apply_proof(scope, slot)
+      }
+
+      // An absent owner's `noproc` `DOWN` was queued at adoption, ahead of
+      // any grace, so the ordinary dispatch has already settled it by the
+      // time this event can fire; the arm is totality.
+      ProofAbsent -> scope
+      ProofDrained -> scope
+      ProofLost(..) -> scope
+      ProofUnconfirmed -> scope
+    }
+  })
 }
 
 /// A worker answered. Its slot stays taken until the outcome is delivered, and
@@ -1073,9 +2085,9 @@ fn note_report(scope: Scope(a, e), report: Report(a, e)) -> Scope(a, e) {
 
 /// A linked process died. Which one decides everything.
 fn note_exit(scope: Scope(a, e), pid: Pid, reason: ExitReason) -> Scope(a, e) {
-  // The caller is the only linked process that is not a worker. Its death ends
-  // the run: there is nobody to deliver to, so the scope's remaining duty is to
-  // make sure nothing it spawned survives it.
+  // The caller's death ends the run: there is nobody to deliver to, so the
+  // scope's remaining duty is to make sure nothing it spawned survives it —
+  // and, for managed work, to keep witnessing until every owner has drained.
   use <- bool.lazy_guard(when: pid == scope.caller, return: fn() {
     detach(scope, Gone)
   })
@@ -1087,14 +2099,38 @@ fn note_exit(scope: Scope(a, e), pid: Pid, reason: ExitReason) -> Scope(a, e) {
         Scope(..scope, running: rest),
         classify_exit(index, reason, scope.cancelling),
       )
-    // Already accounted: this is the ordinary exit that follows a report, or a
-    // kill that landed on a worker which had already answered.
-    Error(Nil) ->
-      Scope(
-        ..scope,
-        finishing: list.filter(scope.finishing, fn(other) { other != pid }),
-      )
+    // Already accounted, or not a worker at all.
+    Error(Nil) -> reap_settled_exit(scope, pid, reason)
   }
+}
+
+/// An exit from something that owes no outcome: a worker that already
+/// answered, or a cancel helper. Both are erased from the ledgers that keep
+/// `settled` honest; a helper that crashed is logged, because a broken
+/// `cancel` closure is a bug its author needs to see and must cost the run
+/// nothing else.
+fn reap_settled_exit(
+  scope: Scope(a, e),
+  pid: Pid,
+  reason: ExitReason,
+) -> Scope(a, e) {
+  use <- bool.lazy_guard(when: !list.contains(scope.helpers, pid), return: fn() {
+    Scope(
+      ..scope,
+      finishing: list.filter(scope.finishing, fn(other) { other != pid }),
+    )
+  })
+
+  case reason {
+    process.Abnormal(..) ->
+      sys.warn("weft: a managed task's cancel closure crashed")
+    process.Normal -> Nil
+    process.Killed -> Nil
+  }
+  Scope(
+    ..scope,
+    helpers: list.filter(scope.helpers, fn(other) { other != pid }),
+  )
 }
 
 /// Turn a worker's exit into an outcome.
@@ -1120,8 +2156,42 @@ fn classify_exit(
   }
 }
 
-/// Queue an outcome for delivery and apply the failure policy to it.
+/// Settle one task's worker fact against its ownership fact.
+///
+/// A plain task settles directly. A managed one settles only when its
+/// owner's proof is in: a pending proof withholds the outcome, and a
+/// resolved one seals it — the worker's own answer where the drain was
+/// proven, `DrainProofLost` or `CancellationUnconfirmed` where it was not.
 fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
+  case proof_for(scope.owners, outcome.index) {
+    None -> queue_outcome(scope, outcome)
+    Some(ProofPending) ->
+      Scope(..scope, awaiting: [#(outcome.index, outcome), ..scope.awaiting])
+    Some(ProofAbsent) ->
+      Scope(..scope, awaiting: [#(outcome.index, outcome), ..scope.awaiting])
+    Some(ProofDrained) -> queue_outcome(scope, outcome)
+    Some(ProofLost(reason:)) ->
+      queue_outcome(scope, DrainProofLost(index: outcome.index, reason:))
+    Some(ProofUnconfirmed) ->
+      queue_outcome(scope, CancellationUnconfirmed(index: outcome.index))
+  }
+}
+
+/// Seal a withheld outcome with the proof that just resolved. The pending
+/// arm restores the stash — unreachable from `apply_proof`, which only
+/// seals resolved proofs, but the type owns it.
+fn seal_outcome(outcome: Outcome(a, e), proof: Proof) -> Outcome(a, e) {
+  case proof {
+    ProofPending -> outcome
+    ProofAbsent -> outcome
+    ProofDrained -> outcome
+    ProofLost(reason:) -> DrainProofLost(index: outcome.index, reason:)
+    ProofUnconfirmed -> CancellationUnconfirmed(index: outcome.index)
+  }
+}
+
+/// Queue a sealed outcome for delivery and apply the failure policy to it.
+fn queue_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
   // A consumer that has halted or died is not owed an account, and queueing for
   // it would grow a backlog nobody will ever drain.
   let scope = case scope.consumer {
@@ -1131,12 +2201,18 @@ fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
     Gone -> scope
   }
 
+  // A lost proof ends the run the way a crash does: the caller asked for
+  // fail-fast, and "we no longer know whether that task's work stopped" is
+  // a failure by any reading. An unconfirmed cancellation does not — it can
+  // only exist once cancellation has already begun.
   let ends_the_run = case outcome {
     Failed(..) -> True
     Crashed(..) -> True
+    DrainProofLost(..) -> True
     Completed(..) -> False
     Abandoned(..) -> False
     NeverStarted(..) -> False
+    CancellationUnconfirmed(..) -> False
   }
   use <- bool.guard(when: !ends_the_run, return: scope)
 
@@ -1144,6 +2220,29 @@ fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
     KeepGoing -> scope
     CancelSiblings -> begin_cancel(scope)
   }
+}
+
+/// The proof standing for a task's owner, or `None` for a plain task.
+fn proof_for(owners: List(OwnerSlot), index: Int) -> Option(Proof) {
+  case list.find(owners, fn(slot) { slot.index == index }) {
+    Ok(slot) -> Some(slot.proof)
+    Error(Nil) -> None
+  }
+}
+
+/// The slot watching `pid`, if any.
+fn find_owner(owners: List(OwnerSlot), pid: Pid) -> Result(OwnerSlot, Nil) {
+  list.find(owners, fn(slot) { slot.pid == pid })
+}
+
+/// Replace a slot in the ledger, matching on its task index.
+fn put_owner(owners: List(OwnerSlot), slot: OwnerSlot) -> List(OwnerSlot) {
+  list.map(owners, fn(existing) {
+    case existing.index == slot.index {
+      True -> slot
+      False -> existing
+    }
+  })
 }
 
 /// Stop delivering entirely: the consumer either halted or died.
@@ -1168,20 +2267,71 @@ fn begin_cancel(scope: Scope(a, e)) -> Scope(a, e) {
   // spawned still running, whatever a task does after it returns.
   list.each(scope.finishing, process.kill)
 
+  // Owners are asked, never killed: each unresolved owner's `cancel` runs on
+  // a disposable helper, and the grace — if one was configured — starts now,
+  // one window for the whole teardown rather than one per task.
+  let scope = arm_grace(dispatch_cancels(scope))
+
+  // Never-started outcomes route through the ordinary settle so a managed
+  // task that never ran still waits for — and is sealed by — its owner's
+  // proof.
   let never_started =
     list.map(scope.pending, fn(slot) { NeverStarted(index: slot.0) })
-
-  Scope(
-    ..scope,
-    cancelling: True,
-    pending: [],
-    ready: push_all_backlog(scope.ready, never_started),
-  )
+  let scope = Scope(..scope, cancelling: True, pending: [])
+  list.fold(never_started, scope, note_outcome)
 }
 
-/// Say `Done`, drop the link, and let the process end.
+/// Run every unresolved owner's `cancel` on its own disposable helper.
+///
+/// One helper per owner, spawned linked so nothing outlives the scope, and
+/// tracked so the scope does not return while one runs. Disposable is the
+/// point: a `cancel` closure that crashes costs the run a log line, never
+/// its witness. Sending every ask before waiting on anything is the same
+/// kill-then-join ordering the workers get.
+fn dispatch_cancels(scope: Scope(a, e)) -> Scope(a, e) {
+  list.fold(scope.owners, scope, fn(scope, slot) {
+    case slot.proof, slot.canceller {
+      ProofPending, None -> {
+        let helper = process.spawn(slot.cancel)
+
+        let slot = OwnerSlot(..slot, canceller: Some(helper))
+        Scope(..scope, owners: put_owner(scope.owners, slot), helpers: [
+          helper,
+          ..scope.helpers
+        ])
+      }
+
+      ProofPending, Some(..) -> scope
+      ProofAbsent, _canceller -> scope
+      ProofDrained, _canceller -> scope
+      ProofLost(..), _canceller -> scope
+      ProofUnconfirmed, _canceller -> scope
+    }
+  })
+}
+
+/// Arm the cancellation grace, if the run configured one.
+fn arm_grace(scope: Scope(a, e)) -> Scope(a, e) {
+  case scope.grace, scope.grace_timer {
+    Some(milliseconds), None ->
+      Scope(
+        ..scope,
+        grace_timer: Some(process.send_after(
+          scope.grace_alarm,
+          milliseconds,
+          Nil,
+        )),
+      )
+
+    Some(..), Some(..) -> scope
+    None, _timer -> scope
+  }
+}
+
+/// Say `Done`, drop the link, and let the process end carrying the verdict.
 fn finish(scope: Scope(a, e)) -> Nil {
   flush_deadline(scope)
+  flush_grace(scope)
 
   case scope.consumer {
     Gone -> Nil
@@ -1192,9 +2342,49 @@ fn finish(scope: Scope(a, e)) -> Nil {
 
   // Unlinking from this side means no exit signal is ever generated, which is
   // what keeps a caller that traps exits from seeing the scope's ordinary
-  // finish as unexpected mailbox noise. Doing it here, after the last thing
-  // that could fail, leaves the link covering the entire run.
+  // finish as unexpected mailbox noise — the verdict below travels by
+  // monitor, never down this link. Doing it here, after the last thing that
+  // could fail, leaves the link covering the entire run.
   process.unlink(scope.caller)
+
+  // The exit reason is the run's drain verdict, which is what lets scopes
+  // compose: an outer witness monitoring this pid learns "everything this
+  // run started is provably gone" from a normal exit and nothing else, so a
+  // lost or unconfirmed proof must exit loudly. `erlang:exit/1` raises, so
+  // trapping does not soften it.
+  case scope.verdict {
+    AllDrained -> Nil
+    SomeUnconfirmed -> stop_self("weft_drain_unconfirmed")
+    SomeLost -> stop_self("weft_drain_proof_lost")
+  }
+}
+
+/// Exit this process abnormally with `reason` as an atom.
+fn stop_self(reason: String) -> Nil {
+  let _never = exit_self(atom.create(reason))
+  Nil
+}
+
+/// `erlang:exit/1`: raise an exit with the given reason. Never returns; the
+/// stock BIF's shape lines up with a Gleam signature directly, so no shim
+/// module is needed.
+@external(erlang, "erlang", "exit")
+fn exit_self(reason: atom.Atom) -> Bool
+
+/// Cancel the grace timer, and drain its message if it beat us to it. The
+/// same flush `flush_deadline` does, for the same reason.
+fn flush_grace(scope: Scope(a, e)) -> Nil {
+  case scope.grace_timer {
+    None -> Nil
+    Some(timer) ->
+      case process.cancel_timer(timer) {
+        process.Cancelled(_) -> Nil
+        process.TimerNotFound -> {
+          let _fired = process.receive(scope.grace_alarm, 0)
+          Nil
+        }
+      }
+  }
 }
 
 /// Cancel the deadline timer, and drain its message if it beat us to it.
@@ -1241,13 +2431,6 @@ fn push_backlog(
   outcome: Outcome(a, e),
 ) -> Backlog(a, e) {
   Backlog(..backlog, back: [outcome, ..backlog.back])
-}
-
-fn push_all_backlog(
-  backlog: Backlog(a, e),
-  outcomes: List(Outcome(a, e)),
-) -> Backlog(a, e) {
-  list.fold(outcomes, backlog, push_backlog)
 }
 
 fn pop_backlog(
