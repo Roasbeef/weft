@@ -175,6 +175,7 @@ pub fn handlers_with_different_state_types_share_one_list_test() -> Nil {
 
   assert process.receive(counts, 0) == Ok(2)
   assert process.receive(words, 0) == Ok(["alpha", "beta"])
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 2
 
   discard(started.pid)
 }
@@ -262,9 +263,10 @@ pub fn a_failed_handler_is_removed_without_disturbing_siblings_test() -> Nil {
       "before:two", "after:two",
     ]
 
-  // The manager itself is untouched: the counter's state threaded across the
-  // event that removed a sibling.
+  // The manager itself is untouched: it still holds the other three, and the
+  // counter's state threaded across the event that removed a sibling.
   assert process.receive(counts, 0) == Ok(3)
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 3
 
   discard(started.pid)
 }
@@ -287,6 +289,8 @@ pub fn remove_self_removes_exactly_that_handler_test() -> Nil {
 
   assert drain(log)
     == ["before:a", "retiring:once", "after:a", "before:b", "after:b"]
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 2
+
   discard(started.pid)
 }
 
@@ -306,6 +310,7 @@ pub fn a_hand_threaded_handler_keeps_its_successor_test() -> Nil {
   event_manager.sync_notify(started.data, Word("c"), waiting: 1000)
 
   assert drain(log) == ["count:2", "count:1"]
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 0
 
   discard(started.pid)
 }
@@ -330,6 +335,78 @@ pub fn sync_notify_returns_only_after_every_handler_has_run_test() -> Nil {
   event_manager.sync_notify(started.data, Word("now"), waiting: 1000)
 
   assert drain(log) == ["first:now", "second:now"]
+
+  discard(started.pid)
+}
+
+// ------------------------------------------------------- runtime additions
+
+pub fn a_handler_added_at_runtime_sees_only_later_events_test() -> Nil {
+  // Two claims in one sequence: the late handler misses the event that was
+  // already handled, and it is appended rather than prepended, so it runs
+  // last on the event it does see.
+  let log = process.new_subject()
+
+  let assert Ok(started) =
+    event_manager.new()
+    |> event_manager.add(tracer("early", log))
+    |> event_manager.start
+    as "the manager must start"
+
+  event_manager.sync_notify(started.data, Word("before"), waiting: 1000)
+
+  // `add_handler` is fire-and-forget, and needs no synchronisation of its
+  // own: messages from one process to one process keep their order, so the
+  // event sent next cannot be handled before the handler is in the list.
+  event_manager.add_handler(started.data, tracer("late", log))
+  event_manager.sync_notify(started.data, Word("after"), waiting: 1000)
+
+  assert drain(log) == ["early:before", "early:after", "late:after"]
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 2
+
+  discard(started.pid)
+}
+
+pub fn count_handlers_tracks_additions_and_departures_test() -> Nil {
+  // The count is the only external view of the list, so it is worth walking
+  // it through every way the list can change: built, added to, retired from,
+  // and failed out of.
+  let log = process.new_subject()
+
+  let assert Ok(started) =
+    event_manager.new()
+    |> event_manager.add(tracer("keep", log))
+    |> event_manager.add(once("retiring", log))
+    |> event_manager.add(brittle(log))
+    |> event_manager.start
+    as "the manager must start"
+
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 3
+
+  event_manager.add_handler(started.data, tracer("late", log))
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 4
+
+  // The retiring handler goes on this event.
+  event_manager.sync_notify(started.data, Word("hello"), waiting: 1000)
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 3
+
+  // The brittle one goes on this one.
+  event_manager.sync_notify(started.data, Word("poison"), waiting: 1000)
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 2
+
+  discard(started.pid)
+}
+
+pub fn an_empty_manager_handles_events_test() -> Nil {
+  // A bus started before its consumers exist is the ordinary supervised
+  // shape, so an empty fan-out has to be a no-op rather than an error.
+  let assert Ok(started) = event_manager.new() |> event_manager.start
+    as "the manager must start with no handlers"
+
+  event_manager.notify(started.data, Word("nobody is listening"))
+  event_manager.sync_notify(started.data, Flush, waiting: 1000)
+
+  assert event_manager.count_handlers(started.data, waiting: 1000) == 0
 
   discard(started.pid)
 }

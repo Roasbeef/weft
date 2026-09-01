@@ -33,6 +33,7 @@
 ////
 //// - Handlers run in the order they were added, and a successor takes its
 ////   predecessor's place in the list, so the order is stable across events.
+////   `add_handler` at runtime appends, so a late handler runs last.
 //// - A handler returning `Failed` is removed and the reason is logged. Its
 ////   siblings do not see the removal at all: they were run before it or are
 ////   run after it, from the same fan-out.
@@ -76,6 +77,12 @@
 //// removal notification is usually used for; an `on_handler_exit` builder
 //// option waits for a real consumer rather than being guessed at now.
 ////
+//// **Handler identity.** `add_handler` returns `Nil`, so there is no
+//// `HandlerRef` and no `delete_handler(ref)`. `RemoveSelf` covers removal
+//// from the inside, which is every case seen so far. External removal, and
+//// the reference type it would need, are deferred until something actually
+//// wants them.
+////
 //// ## Example
 ////
 //// A session bus where one handler counts tokens and another accumulates a
@@ -89,9 +96,11 @@
 ////   |> event_manager.add(event_manager.handler(transcript, on_event: append))
 ////   |> event_manager.start
 ////
+//// event_manager.notify(started.data, Token("hello"))
+////
 //// // A full disk removes the transcript with `Failed`; the counter keeps
-//// // counting, and this returns once it has.
-//// event_manager.sync_notify(started.data, Token("hello"), waiting: 1000)
+//// // counting, and this returns 1.
+//// event_manager.count_handlers(started.data, waiting: 1000)
 //// ```
 
 import gleam/erlang/process.{type Subject}
@@ -231,10 +240,10 @@ pub fn handler_with_outcome(
 /// What a manager accepts.
 ///
 /// Opaque, because every constructor has a function in this module that
-/// sends it correctly — `notify` and `sync_notify` — and a hand-built
-/// `SyncNotify` with the wrong reply subject is a hang rather than a type
-/// error. The type is public so that a caller can name
-/// `process.Name(Message(event))` for `named`, and
+/// sends it correctly — `notify`, `sync_notify`, `add_handler`,
+/// `count_handlers` — and a hand-built `SyncNotify` with the wrong reply
+/// subject is a hang rather than a type error. The type is public so that a
+/// caller can name `process.Name(Message(event))` for `named`, and
 /// `Subject(Message(event))` for whatever it stores the manager in.
 pub opaque type Message(event) {
   /// Fan the event out to every handler. Nobody is waiting.
@@ -244,6 +253,13 @@ pub opaque type Message(event) {
   /// caller's wait mean "every handler has finished", so it is sent after
   /// the fan-out and never before it.
   SyncNotify(event: event, reply: Subject(Nil))
+
+  /// Append a handler. It sees events sent after this message, and no
+  /// earlier ones.
+  AddHandler(handler: Handler(event))
+
+  /// How many handlers are in the list right now.
+  CountHandlers(reply: Subject(Int))
 }
 
 // ----------------------------------------------------------------- builder
@@ -262,13 +278,16 @@ pub opaque type Builder(event) {
 
 /// Describe a manager with no handlers.
 ///
-/// A manager with an empty list is not degenerate: every `notify` is simply
-/// a no-op, which is what a bus wants while it is being wired up.
+/// A manager with an empty list is useful rather than degenerate: every
+/// `notify` is a no-op until something subscribes with `add_handler`, which
+/// is the usual shape for a bus started by a supervisor before its consumers
+/// exist.
 ///
 /// ## Examples
 ///
 /// ```gleam
-/// event_manager.new() |> event_manager.add(audit_log)
+/// let assert Ok(started) = event_manager.new() |> event_manager.start
+/// event_manager.add_handler(started.data, audit_log)
 /// ```
 pub fn new() -> Builder(event) {
   Builder(handlers: [], name: None)
@@ -421,6 +440,51 @@ pub fn sync_notify(
   })
 }
 
+/// Add a handler to a running manager.
+///
+/// The handler is appended, so it runs last in the fan-out, and it sees only
+/// events sent after this call — messages to one process from one process
+/// arrive in order, so an event sent after this one cannot be handled before
+/// the handler is in the list.
+///
+/// There is no handle to remove it by; see this module's header on handler
+/// identity, and `RemoveSelf` for removal from the inside.
+///
+/// ## Examples
+///
+/// ```gleam
+/// event_manager.add_handler(bus, audit_log)
+/// // The audit log sees this event, and none before it.
+/// event_manager.notify(bus, Token("hello"))
+/// ```
+pub fn add_handler(
+  manager: Subject(Message(event)),
+  handler: Handler(event),
+) -> Nil {
+  actor.send(manager, AddHandler(handler:))
+}
+
+/// How many handlers the manager currently holds.
+///
+/// The count falls as handlers remove themselves and as broken ones are
+/// dropped, so it is the observable side of `RemoveSelf` and `Failed`.
+///
+/// `waiting` is milliseconds, and the caller crashes on timeout for the
+/// reason given on `sync_notify`.
+///
+/// ## Examples
+///
+/// ```gleam
+/// event_manager.count_handlers(bus, waiting: 1000)
+/// // -> 2
+/// ```
+pub fn count_handlers(
+  manager: Subject(Message(event)),
+  waiting timeout: Int,
+) -> Int {
+  actor.call(manager, waiting: timeout, sending: CountHandlers)
+}
+
 // -------------------------------------------------------------------- loop
 
 /// The manager's message handler: an ordinary actor handler whose state is
@@ -443,6 +507,13 @@ fn handle(
       // moving it above the fan-out would turn the call into an expensive
       // `notify`.
       process.send(reply, Nil)
+      actor.continue(handlers)
+    }
+
+    AddHandler(handler:) -> actor.continue(list.append(handlers, [handler]))
+
+    CountHandlers(reply:) -> {
+      process.send(reply, list.length(handlers))
       actor.continue(handlers)
     }
   }
