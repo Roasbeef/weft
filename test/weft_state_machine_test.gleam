@@ -17,11 +17,15 @@
 //// delivers the fire — otherwise a timer that never fired at all would pass.
 //// Each such pair is written as two tests that differ in one line.
 
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
+import gleam/otp/actor as otp_actor
+import gleam/otp/static_supervisor as supervisor
 import gleam/otp/system
+import gleam/string
 import gleeunit
 import weft/state_machine as sm
 
@@ -572,4 +576,235 @@ pub fn named_timeouts_are_independent_of_each_other_test() -> Nil {
   assert sm.call(started.data, waiting: 1000, sending: Rings) == ["supper"]
 
   discard(started.pid)
+}
+
+// ------------------------------------------------------------ debug plane
+
+/// `sys:get_status/1` has no Gleam binding. The observer calls it, so a test
+/// that wants to prove the observer would render this machine has to call it
+/// the same way.
+@external(erlang, "sys", "get_status")
+fn get_status(pid: Pid) -> Dynamic
+
+/// Read an atom out of a nested position in a raw Erlang term.
+fn atom_at(data: Dynamic, path: List(Int)) -> String {
+  let assert Ok(value) = decode.run(data, decode.at(path, atom.decoder()))
+    as "the status reply must have an atom at this position"
+  atom.to_string(value)
+}
+
+pub fn get_state_reports_the_state_and_the_data_test() -> Nil {
+  let started = start_clockwork()
+
+  sm.send(started.data, Move(Beta))
+  sm.send(started.data, Rang("hello"))
+
+  // Sync on a call so that both events are certainly handled before the pair
+  // is read out of band.
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == ["hello"]
+  assert view(started.pid) == #("beta", ["hello"])
+
+  discard(started.pid)
+}
+
+pub fn get_status_replies_in_the_shape_the_observer_reads_test() -> Nil {
+  let started = start_clockwork()
+  let status = get_status(started.pid)
+
+  // `{status, Pid, {module, Module}, [PDict, Mode, Parent, Debug, Format]}`
+  // is what `sys:get_status/1` specifies and what the observer's process
+  // view renders.
+  assert atom_at(status, [0]) == "status"
+  assert atom_at(status, [2, 0]) == "module"
+  assert atom_at(status, [2, 1]) == "weft@state_machine"
+  assert atom_at(status, [3, 1]) == "running"
+
+  let assert Ok(parent) = decode.run(status, decode.at([3, 2], decode.dynamic))
+    as "the status report names the parent"
+  assert string.inspect(parent) == string.inspect(process.self())
+
+  discard(started.pid)
+}
+
+pub fn a_suspended_machine_serves_only_the_debug_plane_test() -> Nil {
+  let started = start_clockwork()
+
+  sm.send(started.data, Rang("first"))
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == ["first"]
+
+  system.suspend(started.pid)
+
+  // The event is now stuck in the mailbox behind the suspension, so the pair
+  // read out of band must still be the old one.
+  sm.send(started.data, Rang("second"))
+  process.sleep(50)
+  assert view(started.pid) == #("alpha", ["first"])
+
+  system.resume(started.pid)
+  assert sm.call(started.data, waiting: 1000, sending: Rings)
+    == ["first", "second"]
+
+  discard(started.pid)
+}
+
+pub fn suspension_freezes_the_machine_s_timers_too_test() -> Nil {
+  // A suspended machine is frozen, not quiet: a deadline that elapsed
+  // entirely inside the suspension describes a stretch the machine was never
+  // allowed to act in, so it is disarmed on the way in and restarted from
+  // full on the way out.
+  let started = start_clockwork()
+
+  sm.send(started.data, NamedTimeoutIn("dinner", 120))
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  system.suspend(started.pid)
+  process.sleep(300)
+
+  // Two facts at once: nothing rang during the freeze, and the machine is
+  // answering again the instant it resumes.
+  system.resume(started.pid)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  // And the timer was put back rather than dropped.
+  process.sleep(300)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == ["dinner"]
+
+  discard(started.pid)
+}
+
+// -------------------------------------------------------------- shutdown
+
+pub fn stop_shuts_the_machine_down_test() -> Nil {
+  let assert Ok(started) =
+    sm.new(Alpha, []) |> sm.on_event(holding_in([])) |> sm.start
+    as "the machine must start"
+
+  process.unlink(started.pid)
+  sm.send(started.data, Halt)
+
+  process.sleep(50)
+  assert !process.is_alive(started.pid)
+}
+
+pub fn a_trapped_parent_exit_shuts_the_machine_down_test() -> Nil {
+  let handoff = process.new_subject()
+
+  // The machine is started by a process of its own so that the test can kill
+  // its parent without killing itself.
+  let parent =
+    process.spawn_unlinked(fn() {
+      let assert Ok(started) =
+        sm.new(Alpha, [])
+        |> sm.trapping_exits(True)
+        |> sm.on_event(holding_in([]))
+        |> sm.start
+        as "the machine must start"
+
+      process.send(handoff, started.pid)
+      process.sleep_forever()
+    })
+
+  let assert Ok(machine) = process.receive(handoff, 1000)
+    as "the intermediate parent must hand the machine over"
+
+  process.kill(parent)
+
+  // The exit signal reaches the machine as a message because it traps, and
+  // the parent's exit takes a child with it whatever the reason.
+  process.sleep(100)
+  assert !process.is_alive(machine)
+}
+
+pub fn a_suspended_machine_still_shuts_down_on_a_parent_exit_test() -> Nil {
+  // A supervisor terminating a suspended child must not have to wait out its
+  // shutdown timeout: the frozen loop still watches for exits.
+  let handoff = process.new_subject()
+
+  let parent =
+    process.spawn_unlinked(fn() {
+      let assert Ok(started) =
+        sm.new(Alpha, [])
+        |> sm.trapping_exits(True)
+        |> sm.on_event(holding_in([]))
+        |> sm.start
+        as "the machine must start"
+
+      process.send(handoff, started.pid)
+      process.sleep_forever()
+    })
+
+  let assert Ok(machine) = process.receive(handoff, 1000)
+    as "the intermediate parent must hand the machine over"
+
+  system.suspend(machine)
+  process.kill(parent)
+
+  process.sleep(100)
+  assert !process.is_alive(machine)
+}
+
+// -------------------------------------------------------- upstream parity
+
+pub fn a_named_machine_is_reachable_by_its_name_test() -> Nil {
+  let name = process.new_name("weft_statem_named")
+
+  let assert Ok(started) =
+    sm.new(Alpha, [])
+    |> sm.named(name)
+    |> sm.on_event(holding_in([]))
+    |> sm.start
+    as "the machine must start"
+
+  let subject = process.named_subject(name)
+  sm.send(subject, Note("hello"))
+  assert sm.call(subject, waiting: 1000, sending: Report) == ["hello"]
+
+  discard(started.pid)
+}
+
+pub fn a_weft_machine_runs_and_restarts_under_a_gleam_otp_supervisor_test() -> Nil {
+  let name = process.new_name("weft_statem_supervised")
+
+  let child =
+    sm.new(Alpha, [])
+    |> sm.named(name)
+    |> sm.on_event(holding_in([]))
+    |> sm.supervised
+
+  let assert Ok(started) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(child)
+    |> supervisor.start
+    as "the supervisor must start its weft child"
+
+  let subject = process.named_subject(name)
+  sm.send(subject, Note("first"))
+  assert sm.call(subject, waiting: 1000, sending: Report) == ["first"]
+
+  let assert Ok(first) = process.named(name)
+    as "a started machine is registered under its name"
+
+  // Killing the child and finding a fresh one under the same name is what
+  // proves `supervised` produced a real child specification rather than a
+  // one-shot start: a supervisor that could not restart it would leave the
+  // name unregistered.
+  process.kill(first)
+  process.sleep(200)
+
+  let assert Ok(second) = process.named(name)
+    as "the supervisor must put a fresh machine back under the name"
+  assert first != second
+  assert sm.call(process.named_subject(name), waiting: 1000, sending: Report)
+    == []
+
+  discard(started.pid)
+}
+
+pub fn an_initialiser_error_is_reported_as_init_failed_test() -> Nil {
+  let result =
+    sm.new_with_initialiser(1000, fn(_subject) { Error("no socket") })
+    |> sm.on_event(holding_in([]))
+    |> sm.start
+
+  assert result == Error(otp_actor.InitFailed("no socket"))
 }
