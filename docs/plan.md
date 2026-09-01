@@ -13,6 +13,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
 | `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
+| `weft/poll` | loom#159 phase 2 | main | Bounded synchronous polling for foreground waits; owns no process |
 | `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.3.1` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.3.1), `cancel_when_exits`; many owners per task |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and

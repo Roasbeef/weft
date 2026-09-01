@@ -152,6 +152,36 @@ A handler that fails is removed and logged without disturbing its siblings,
 and the type forces it to say why. A handler that needs to be queried is not
 a handler; it is an actor that happens to subscribe.
 
+## weft/poll — bounded polling in the caller's own process
+
+Some waits cannot be handed to another process: the waiter is the one that
+needs the answer, the thing it waits on is a synchronous probe, and the only
+honest bound is the wall clock. `poll.until` is that loop decided once — the
+first attempt is immediate, a last attempt is made at the deadline, and a
+probe that failed for good is told apart from one that merely has not
+succeeded yet:
+
+```gleam
+import weft/poll
+
+case
+  poll.until(within: 5000, every: 25, attempt: fn() {
+    case try_lock(path) {
+      Ok(lock) -> poll.Done(lock)
+      Error("busy") -> poll.Retry
+      Error(reason) -> poll.Fail(reason)
+    }
+  })
+{
+  poll.Answered(lock) -> Ok(lock)
+  poll.Failed(reason) -> Error("acquire lock: " <> reason)
+  poll.Expired -> Error("timed out waiting for the lock")
+}
+```
+
+It owns no process; a wait that could be a message should be a
+`weft/state_machine` state with a timeout instead.
+
 ## Relationship to gleam_otp
 
 Weft is not a fork and not a competing framework. Its types interoperate

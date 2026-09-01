@@ -38,6 +38,10 @@ makes sense whole.
   state is the handler list; it has no loop of its own). Reaches into
   `weft/internal/sys` for exactly one thing: `warn`, so a dropped handler
   leaves a trace.
+- **`weft/poll`** — bounded synchronous polling in the caller's own
+  process (`until` with an immediate first attempt, a last attempt at the
+  deadline, `Fail` distinct from `Retry`). Owns no process; depends only
+  on `gleam_erlang/process` for the sleep and a monotonic-clock external.
 - **`weft/internal/timer`** — the named-timer book: generation-stamped
   fires, `accept` as the only consumption path. Cancel-with-flush is two
   halves: `cancel` stops what it can, `accept` drops what it could not.
@@ -112,6 +116,7 @@ weft ──────────────► gleam_erlang/process, interna
 weft/actor ────────► internal/{sys,timer}, gleam_otp (types only)
 weft/state_machine ► internal/{sys,timer}, gleam_otp (types only)
 weft/event_manager ► weft/actor, internal/sys (warn ONLY)
+weft/poll ─────────► gleam_erlang/process (sleep only)
 ```
 
 Adding an edge not in this picture is a design change: it goes through
