@@ -1667,9 +1667,11 @@ type Event(a, e) {
   /// The cancellation grace ran out with owners still unaccounted for.
   GracePassed
 
-  /// A monitored process died: the cancel signal or a managed owner. Which
-  /// one is the dispatch's problem — the selector only knows it was watched.
-  WatchedDown(pid: Pid, reason: ExitReason)
+  /// A monitored process died: the cancel signal, a watched consumer, or a
+  /// managed owner. Which one is the dispatch's problem — the selector only
+  /// knows it was watched. The monitor rides along because one pid may be
+  /// watched for more than one reason, and each watch answers once.
+  WatchedDown(pid: Pid, monitor: process.Monitor, reason: ExitReason)
 
   /// A monitored *port* died. The scope never monitors ports, so this is
   /// totality for the generic monitor arm, not an event with a meaning.
@@ -1984,7 +1986,8 @@ fn ignoring(begin: fn() -> Result(a, e)) -> fn(Ledger) -> Result(a, e) {
 /// unreachable — the scope never monitors one — but the type owns them.
 fn watched_down(down: process.Down) -> Event(a, e) {
   case down {
-    process.ProcessDown(pid:, reason:, ..) -> WatchedDown(pid:, reason:)
+    process.ProcessDown(pid:, monitor:, reason:) ->
+      WatchedDown(pid:, monitor:, reason:)
     process.PortDown(..) -> PortWatched
   }
 }
@@ -2136,7 +2139,8 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
     // message this branch already consumed.
     DeadlinePassed -> begin_cancel(Scope(..scope, timer: None))
     GracePassed -> expire_grace(Scope(..scope, grace_timer: None))
-    WatchedDown(pid:, reason:) -> note_watched_down(scope, pid, reason)
+    WatchedDown(pid:, monitor:, reason:) ->
+      note_watched_down(scope, pid, monitor, reason)
     PortWatched -> scope
 
     // The reply to a system request is sent from inside `handle`, before the
@@ -2214,26 +2218,33 @@ fn adopt_published(
   }
 }
 
-/// A watched process died: the cancel signal, or a managed owner.
+/// A watched process died: the cancel signal, a `cancel_when_exits` pid,
+/// or a managed owner — and possibly two of those at once, since a caller
+/// may both watch a pid and adopt it. Both meanings are honoured: the
+/// watch cancels the run, and the owner slot, if this monitor is one,
+/// resolves. Slots are matched by monitor rather than pid so that the
+/// watch's own `DOWN` cannot resolve the slot, and the slot's `DOWN`
+/// resolves it exactly once.
 fn note_watched_down(
   scope: Scope(a, e),
   pid: Pid,
+  monitor: process.Monitor,
   reason: ExitReason,
 ) -> Scope(a, e) {
-  use <- bool.lazy_guard(
-    when: list.contains(scope.signal_pids, pid),
-    return: fn() { begin_cancel(scope) },
-  )
-  resolve_owner(scope, pid, reason)
+  let scope = case list.contains(scope.signal_pids, pid) {
+    True -> begin_cancel(scope)
+    False -> scope
+  }
+  resolve_owner(scope, monitor, reason)
 }
 
 /// An owner has exited; record what that proves and act on it.
 fn resolve_owner(
   scope: Scope(a, e),
-  pid: Pid,
+  monitor: process.Monitor,
   reason: ExitReason,
 ) -> Scope(a, e) {
-  case find_owner(scope.owners, pid) {
+  case find_owner(scope.owners, monitor) {
     // A `DOWN` with no slot is a flushed monitor's leftover or somebody
     // else's monitor traffic; there is nothing of ours in it.
     Error(Nil) -> scope
@@ -2628,9 +2639,12 @@ fn proof_for(owners: List(OwnerSlot), index: Int) -> Option(Proof) {
   }
 }
 
-/// The slot watching `pid`, if any.
-fn find_owner(owners: List(OwnerSlot), pid: Pid) -> Result(OwnerSlot, Nil) {
-  list.find(owners, fn(slot) { slot.pid == pid })
+/// The slot behind `monitor`, if any.
+fn find_owner(
+  owners: List(OwnerSlot),
+  monitor: process.Monitor,
+) -> Result(OwnerSlot, Nil) {
+  list.find(owners, fn(slot) { slot.monitor == monitor })
 }
 
 /// Replace a slot in the ledger, matching on its monitor: a task may have

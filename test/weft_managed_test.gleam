@@ -756,3 +756,35 @@ pub fn a_watched_consumers_death_cancels_the_run_test() -> Nil {
   assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
   assert weft.pull(detached, within: 5000) == AllDelivered
 }
+
+pub fn a_pid_both_watched_and_adopted_answers_both_watches_test() -> Nil {
+  let #(worker, commands) = obedient_owner()
+
+  // The parked-worker shape a custodian needs: the same pid is an owner
+  // (so the task waits for it and cancellation asks it to stop) and a
+  // watched exit (so its death, however it dies, fans cancellation out to
+  // the owners adopted beside it). Two monitors, two `DOWN`s, and each
+  // must do exactly its own job.
+  let adopted = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt_leaf(ledger, owner: worker, cancel: deaf_cancel())
+          as "the worker is adopted as a leaf"
+        process.send(adopted, Nil)
+        process.sleep_forever()
+        Ok(Nil)
+      }),
+    ])
+    |> weft.cancel_when_exits(worker)
+    |> weft.start_detached
+  let scope_exit = watch_exit(weft.scope_pid(detached))
+  let assert Ok(Nil) = process.receive(adopted, 2000)
+    as "the worker is adopted before it is drained"
+
+  process.send(commands, DrainCleanly)
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+  assert await_exit(scope_exit) == process.Normal
+}

@@ -115,9 +115,10 @@ additive: no existing signature or variant changes. `0.3.1` changes one
 signature published hours earlier: `start_witnessed` returns a
 `Witnessed` handle (`witness_pid`, `cancel_witnessed`) rather than a bare
 pid, because a witness-only caller still has to be able to cancel without
-paying a signal process per run. Pre-1.0, releases move by the smallest
-step that describes them — patch bumps for follow-ups like this one —
-since the loom adoption is expected to ask for several more.
+paying a signal process per run. From here the loom adoption develops
+against a **path dependency** on this checkout rather than a hex release
+per change; `main` carries a working version number and the next hex
+release is `0.4.0`, cut once loom's phase 2 has settled the surface.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`
