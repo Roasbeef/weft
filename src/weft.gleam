@@ -97,6 +97,28 @@
 //// exit as mailbox noise, because the scope drops the link itself just before
 //// it returns; the link is live for the whole run, which is the part that
 //// matters.
+////
+//// ## Quick start
+////
+//// ```gleam
+//// import weft
+////
+//// pub fn fetch_all(urls: List(String)) {
+////   let outcomes =
+////     urls
+////     |> list.map(fn(url) { fn() { fetch(url) } })
+////     |> weft.new
+////     |> weft.limit(8)
+////     |> weft.on_failure(weft.KeepGoing)
+////     |> weft.deadline(30_000)
+////     |> weft.start
+////
+////   // Every url is accounted for: bodies for the fetches that succeeded,
+////   // and one Outcome per fetch that failed, crashed, or ran out of time.
+////   let #(bodies, rest) = weft.partition(outcomes)
+////   #(bodies, rest)
+//// }
+//// ```
 
 import gleam/bool
 import gleam/erlang/process.{type ExitReason, type Pid, type Subject}
