@@ -38,6 +38,11 @@ makes sense whole.
   state is the handler list; it has no loop of its own). Reaches into
   `weft/internal/sys` for exactly one thing: `warn`, so a dropped handler
   leaves a trace.
+- **`with_selector` on a machine step** — replaces the selector the loop
+  receives with from the next receive on, so a handler can widen the
+  mailbox to a channel it just created (a subject, a monitor) instead of
+  forcing that phase into the initialiser and the start into a trampoline.
+  Same contract as the actor's `with_selector`: replace, not add.
 - **Linkage** — `start` links by default, as OTP does; `unlinked` on the
   actor and machine builders spawns without the link, for a process that
   must neither die with its starter nor take it down (a guard started by

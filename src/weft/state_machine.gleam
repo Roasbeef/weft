@@ -269,6 +269,9 @@ pub opaque type Step(state, data, message, postponing) {
     postponed: Bool,
     injected: List(message),
     timeouts: List(TimeoutAction(message)),
+    /// A replacement for the selector the loop receives with, from
+    /// `with_selector`. `None` keeps the current one.
+    selector: Option(Selector(message)),
   )
 
   /// Stop, exiting with this reason. Pending injected messages, postponed
@@ -343,6 +346,7 @@ pub fn transition(
     postponed: False,
     injected: [],
     timeouts: [],
+    selector: None,
   )
 }
 
@@ -359,7 +363,13 @@ pub fn transition(
 /// // -> same state, new data, state timeout still ticking
 /// ```
 pub fn keep(data: data) -> Step(state, data, message, postponing) {
-  Advance(target: Keeping(data:), postponed: False, injected: [], timeouts: [])
+  Advance(
+    target: Keeping(data:),
+    postponed: False,
+    injected: [],
+    timeouts: [],
+    selector: None,
+  )
 }
 
 /// Stop and shut down, handling no further events.
@@ -421,8 +431,8 @@ pub fn postpone(
   next: Next(state, data, message),
 ) -> Next(state, data, message) {
   case next {
-    Advance(target:, postponed: _, injected:, timeouts:) ->
-      Advance(target:, postponed: True, injected:, timeouts:)
+    Advance(target:, postponed: _, injected:, timeouts:, selector:) ->
+      Advance(target:, postponed: True, injected:, timeouts:, selector:)
     Halt(reason:) -> Halt(reason:)
   }
 }
@@ -535,12 +545,51 @@ fn timing(
   action: TimeoutAction(message),
 ) -> Step(state, data, message, postponing) {
   case step {
-    Advance(target:, postponed:, injected:, timeouts:) ->
+    Advance(target:, postponed:, injected:, timeouts:, selector:) ->
       Advance(
         target:,
         postponed:,
         injected:,
         timeouts: list.append(timeouts, [action]),
+        selector:,
+      )
+    Halt(reason:) -> Halt(reason:)
+  }
+}
+
+/// Replace the selector the machine receives with going forward.
+///
+/// This replaces the selector given at initialisation or by an earlier
+/// step rather than adding to it, so a selector that no longer selects the
+/// machine's own subject stops receiving on it. It is the way a machine
+/// widens its mailbox to a channel that did not exist when it started — a
+/// subject the handler itself just created, a monitor it just installed —
+/// which otherwise forces the whole first phase into the initialiser.
+/// Applying this to `stop` does nothing: there is no "going forward".
+///
+/// ## Examples
+///
+/// ```gleam
+/// let inner = process.new_subject()
+/// sm.transition(to: Forwarding, data: Request(..data, inner:))
+/// |> sm.with_selector(
+///   process.new_selector()
+///   |> process.select(control)
+///   |> process.select_map(inner, InnerEvent),
+/// )
+/// ```
+pub fn with_selector(
+  step: Step(state, data, message, postponing),
+  selector: Selector(message),
+) -> Step(state, data, message, postponing) {
+  case step {
+    Advance(target:, postponed:, injected:, timeouts:, selector: _) ->
+      Advance(
+        target:,
+        postponed:,
+        injected:,
+        timeouts:,
+        selector: Some(selector),
       )
     Halt(reason:) -> Halt(reason:)
   }
@@ -580,12 +629,13 @@ pub fn then_handle(
   message: message,
 ) -> Step(state, data, message, postponing) {
   case step {
-    Advance(target:, postponed:, injected:, timeouts:) ->
+    Advance(target:, postponed:, injected:, timeouts:, selector:) ->
       Advance(
         target:,
         postponed:,
         injected: list.append(injected, [message]),
         timeouts:,
+        selector:,
       )
     Halt(reason:) -> Halt(reason:)
   }
@@ -1524,10 +1574,20 @@ fn commit(
   case step {
     Halt(reason:) -> exit_process(reason)
 
-    Advance(target:, postponed:, injected:, timeouts:) -> {
+    Advance(target:, postponed:, injected:, timeouts:, selector:) -> {
       let self = hold(self, postponed, current)
       let from = self.state
       let self = retarget(self, target)
+
+      // A replaced selector takes effect from the next receive, which is
+      // what lets a handler open a channel it could not have named at
+      // initialisation — a subject created in this process by the work the
+      // event started — without a second process to park in.
+      let self = case selector {
+        None -> self
+        Some(selector) ->
+          Self(..self, selector: process.map_selector(selector, Received))
+      }
 
       // Structural equality is the entire definition of a state change, and
       // it is gen_statem's: moving to the state the machine is already in

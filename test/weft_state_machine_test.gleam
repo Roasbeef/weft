@@ -970,3 +970,57 @@ pub fn an_unlinked_machine_survives_its_starters_crash_test() -> Nil {
   assert process.is_alive(pid)
   process.kill(pid)
 }
+
+// ------------------------------------------------------------ selectors
+
+/// A machine that opens a side channel on demand.
+type Rewire {
+  Open
+  Heard(word: String)
+  Recount(reply: Subject(List(String)))
+}
+
+type Rewired {
+  Rewired(own: Subject(Rewire), heard: List(String))
+}
+
+pub fn a_step_can_replace_the_selector_it_receives_with_test() -> Nil {
+  // The machine starts receiving only on its own subject. `Open` creates a
+  // channel that did not exist at initialisation — a subject the handler
+  // itself makes — hands it out, and widens the selector to it; the
+  // machine must then hear on both.
+  let opened = process.new_subject()
+  let assert Ok(started) =
+    sm.new_with_initialiser(1000, fn(own) {
+      sm.initialised(Alpha, Rewired(own:, heard: []))
+      |> sm.returning(own)
+      |> Ok
+    })
+    |> sm.on_event(fn(_state, data: Rewired, message: Rewire) {
+      case message {
+        Open -> {
+          let side = process.new_subject()
+          process.send(opened, side)
+          sm.keep(data)
+          |> sm.with_selector(
+            process.new_selector()
+            |> process.select(data.own)
+            |> process.select_map(side, Heard),
+          )
+        }
+        Heard(word:) -> sm.keep(Rewired(..data, heard: [word, ..data.heard]))
+        Recount(reply:) -> {
+          process.send(reply, data.heard)
+          sm.keep(data)
+        }
+      }
+    })
+    |> sm.start
+    as "the machine must start"
+
+  process.send(started.data, Open)
+  let assert Ok(side) = process.receive(opened, 2000)
+    as "the handler hands the side channel out"
+  process.send(side, "hello")
+  assert sm.call(started.data, 1000, Recount) == ["hello"]
+}
