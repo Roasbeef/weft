@@ -1,0 +1,8 @@
+Weft
+Copyright 2026 Olaoluwa Osuntokun
+
+The weft/actor module derives from the gleam/otp/actor module of gleam_otp
+(https://github.com/gleam-lang/otp), copyright the Gleam OTP contributors,
+licensed under the Apache License, Version 2.0. The weft/internal/sys module
+and src/weft_sys_ffi.erl derive their system-message handling from the same
+package's gleam/otp/system module and gleam_otp_external.erl.
