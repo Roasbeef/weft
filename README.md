@@ -12,13 +12,6 @@ is what a task is.
 gleam add weft
 ```
 
-Four modules. Each one's full design rationale lives in its module
-documentation; the issues that shaped them are
-[#1](https://github.com/Roasbeef/weft/issues/1),
-[#2](https://github.com/Roasbeef/weft/issues/2),
-[#3](https://github.com/Roasbeef/weft/issues/3) and
-[#4](https://github.com/Roasbeef/weft/issues/4).
-
 ## weft — the run engine
 
 Fan a list of tasks out across a bounded pool of processes and get back a
