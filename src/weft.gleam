@@ -541,6 +541,10 @@ pub fn race(
 /// `KeepGoing`. An empty list is answerable, unlike in `race`, because the error
 /// channel already exists: it yields `Error([])`.
 ///
+/// If something outside the run destroys the scope, the `Error` carries only
+/// the outcomes heard before the death rather than a total account; reach for
+/// `start`, which fills the gap in, when that distinction matters.
+///
 /// ## Examples
 ///
 /// ```gleam
