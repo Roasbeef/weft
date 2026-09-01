@@ -132,6 +132,14 @@
 //// permit to start new work; it never withholds the witness, because an
 //// owner that exists must be drained whatever the run's state.
 ////
+//// An owner may be published *beneath* another owner of the same task
+//// (`adopt_under`, `adopt_leaf_under`). While the parent lives the child is
+//// not asked to stop, cancellation or not: the parent keeps sole custody of
+//// stopping what it started and of arbitrating the result. The parent's
+//// exit — clean or not — is what asks the child, so a coordinating process
+//// that crashed cannot leave its children unasked, and one that finished
+//// cleanly has already stopped them.
+////
 //// `start_witnessed` is the run shape for a caller that wants only that
 //// witness: no outcomes are delivered, and the scope's pid — alive exactly
 //// while any worker, owner or cancel helper is, exiting with the verdict —
@@ -585,7 +593,7 @@ pub fn adopt(
   owner owner: Pid,
   cancel cancel: fn() -> Nil,
 ) -> Adoption {
-  publish(ledger, owner, Transitive, cancel)
+  publish(ledger, owner, Transitive, cancel, None)
 }
 
 /// Publish a leaf owner to a running managed task's scope: an owner that
@@ -605,7 +613,54 @@ pub fn adopt_leaf(
   owner owner: Pid,
   cancel cancel: fn() -> Nil,
 ) -> Adoption {
-  publish(ledger, owner, Leaf, cancel)
+  publish(ledger, owner, Leaf, cancel, None)
+}
+
+/// Publish a transitive owner beneath another owner of the same task.
+///
+/// The child is asked to stop only once `parent` has exited — never beside
+/// it — and it is asked then whether or not the run is cancelling. That is
+/// the staging a coordinating process needs: while the parent lives, the
+/// parent keeps sole custody of cancelling what it started and of
+/// arbitrating the result, and the scope reaches a child directly only
+/// when the parent died without finishing that job. `parent` must already
+/// be an unresolved owner of this task; publishing under one that has
+/// exited is `Refused`, and the child is asked at once.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // The request worker is an owner; the socket it opened is drained by
+/// // the worker on cancel, or by the scope if the worker crashed.
+/// case weft.adopt_under(ledger, parent: worker, owner: socket, cancel:) {
+///   weft.Adopted -> open(socket)
+///   weft.Refused -> Nil
+/// }
+/// ```
+pub fn adopt_under(
+  ledger: Ledger,
+  parent parent: Pid,
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+) -> Adoption {
+  publish(ledger, owner, Transitive, cancel, Some(parent))
+}
+
+/// `adopt_under` for a leaf: any exit completes it, and it is asked to stop
+/// only after its parent has exited.
+///
+/// ## Examples
+///
+/// ```gleam
+/// weft.adopt_leaf_under(ledger, parent: worker, owner: pump, cancel: stop)
+/// ```
+pub fn adopt_leaf_under(
+  ledger: Ledger,
+  parent parent: Pid,
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+) -> Adoption {
+  publish(ledger, owner, Leaf, cancel, Some(parent))
 }
 
 /// The adoption round trip. The scope's death is raced against its reply
@@ -616,12 +671,13 @@ fn publish(
   owner: Pid,
   role: OwnerRole,
   cancel: fn() -> Nil,
+  parent: Option(Pid),
 ) -> Adoption {
   let reply = process.new_subject()
   let watch = process.monitor(ledger.scope)
   process.send(
     ledger.inbox,
-    Publish(index: ledger.index, owner:, role:, cancel:, reply:),
+    Publish(index: ledger.index, owner:, role:, cancel:, parent:, reply:),
   )
   let answer =
     process.new_selector()
@@ -1539,6 +1595,7 @@ type Request {
     owner: Pid,
     role: OwnerRole,
     cancel: fn() -> Nil,
+    parent: Option(Pid),
     reply: Subject(Adoption),
   )
 }
@@ -1728,6 +1785,10 @@ type OwnerSlot {
     proof: Proof,
     /// The helper running `cancel`, once cancellation has dispatched it.
     canceller: Option(Pid),
+    /// The owner this one was published beneath, if any. While the parent
+    /// is unresolved this owner is not asked to stop; the parent's exit
+    /// asks it.
+    parent: Option(Pid),
   )
 }
 
@@ -1968,6 +2029,7 @@ fn adopt_owners(
               cancel:,
               proof:,
               canceller: None,
+              parent: None,
             )
           #([slot, ..owners], pending)
         }
@@ -2131,8 +2193,8 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
       Scope(..scope, consumer: note_demand(scope.consumer))
     Asked(request: Stop) -> detach(scope, Halted)
     Asked(request: CancelRun) -> begin_cancel(scope)
-    Asked(request: Publish(index:, owner:, role:, cancel:, reply:)) ->
-      adopt_published(scope, index, owner, role, cancel, reply)
+    Asked(request: Publish(index:, owner:, role:, cancel:, parent:, reply:)) ->
+      adopt_published(scope, index, owner, role, cancel, parent, reply)
 
     // Clearing the timer here is half of the flush: a timer that has fired
     // cannot be cancelled, and `flush_deadline` must not go looking for a
@@ -2184,6 +2246,7 @@ fn adopt_published(
   owner: Pid,
   role: OwnerRole,
   cancel: fn() -> Nil,
+  parent: Option(Pid),
   reply: Subject(Adoption),
 ) -> Scope(a, e) {
   let monitor = process.monitor(owner)
@@ -2196,10 +2259,19 @@ fn adopt_published(
       cancel:,
       proof: ProofPending,
       canceller: None,
+      parent:,
     )
   let scope = Scope(..scope, owners: [slot, ..scope.owners])
 
-  let refused = scope.cancelling || set.contains(scope.sealed, index)
+  // A parent that is not an unresolved owner of this task cannot stage
+  // anything: publishing under it is refused, and the child is asked at
+  // once, exactly as if its parent had just exited.
+  let orphaned = case parent {
+    None -> False
+    Some(parent_pid) -> !parent_pending(scope.owners, index, parent_pid)
+  }
+  let refused =
+    scope.cancelling || set.contains(scope.sealed, index) || orphaned
   case refused {
     False -> {
       process.send(reply, Adopted)
@@ -2209,13 +2281,21 @@ fn adopt_published(
       process.send(reply, Refused)
 
       // A run that is already cancelling has dispatched its cancels; this
-      // owner arrived after that fan-out, so it gets its own ask now.
-      case scope.cancelling {
+      // owner arrived after that fan-out, so it gets its own ask now. So
+      // does a child whose parent is already gone.
+      case scope.cancelling || orphaned {
         True -> dispatch_cancels(scope)
         False -> scope
       }
     }
   }
+}
+
+/// Is `parent` an owner of task `index` whose exit is still awaited?
+fn parent_pending(owners: List(OwnerSlot), index: Int, parent: Pid) -> Bool {
+  list.any(owners, fn(slot) {
+    slot.index == index && slot.pid == parent && !owner_resolved(slot)
+  })
 }
 
 /// A watched process died: the cancel signal, a `cancel_when_exits` pid,
@@ -2265,9 +2345,22 @@ fn resolve_owner(
           owners: put_owner(scope.owners, slot),
           verdict: worsen_for(scope.verdict, proof),
         )
-      apply_proof(scope, slot)
+
+      // The parent's exit is what asks its children, cancelling or not: a
+      // parent that finished cleanly has nothing left to coordinate, and one
+      // that crashed can no longer be trusted to stop what it started.
+      apply_proof(ask_children(scope, slot), slot)
     }
   }
+}
+
+/// Ask every unresolved owner published beneath `parent` to stop.
+fn ask_children(scope: Scope(a, e), parent: OwnerSlot) -> Scope(a, e) {
+  list.fold(scope.owners, scope, fn(scope, slot) {
+    let child = slot.index == parent.index && slot.parent == Some(parent.pid)
+    use <- bool.guard(when: !child, return: scope)
+    ask_owner(scope, slot)
+  })
 }
 
 /// What one exit reason proves, given what the owner was declared to be
@@ -2703,24 +2796,36 @@ fn begin_cancel(scope: Scope(a, e)) -> Scope(a, e) {
 /// kill-then-join ordering the workers get.
 fn dispatch_cancels(scope: Scope(a, e)) -> Scope(a, e) {
   list.fold(scope.owners, scope, fn(scope, slot) {
-    case slot.proof, slot.canceller {
-      ProofPending, None -> {
-        let helper = process.spawn(slot.cancel)
-
-        let slot = OwnerSlot(..slot, canceller: Some(helper))
-        Scope(..scope, owners: put_owner(scope.owners, slot), helpers: [
-          helper,
-          ..scope.helpers
-        ])
-      }
-
-      ProofPending, Some(..) -> scope
-      ProofAbsent, _canceller -> scope
-      ProofDrained, _canceller -> scope
-      ProofLost(..), _canceller -> scope
-      ProofUnconfirmed, _canceller -> scope
+    // A child under a live parent is the parent's to stop; the parent's
+    // own exit will ask it.
+    let staged = case slot.parent {
+      None -> False
+      Some(parent) -> parent_pending(scope.owners, slot.index, parent)
     }
+    use <- bool.guard(when: staged, return: scope)
+    ask_owner(scope, slot)
   })
+}
+
+/// Run one owner's `cancel` on a disposable helper, once.
+fn ask_owner(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
+  case slot.proof, slot.canceller {
+    ProofPending, None -> {
+      let helper = process.spawn(slot.cancel)
+
+      let slot = OwnerSlot(..slot, canceller: Some(helper))
+      Scope(..scope, owners: put_owner(scope.owners, slot), helpers: [
+        helper,
+        ..scope.helpers
+      ])
+    }
+
+    ProofPending, Some(..) -> scope
+    ProofAbsent, _canceller -> scope
+    ProofDrained, _canceller -> scope
+    ProofLost(..), _canceller -> scope
+    ProofUnconfirmed, _canceller -> scope
+  }
 }
 
 /// Arm the cancellation grace, if the run configured one.

@@ -18,7 +18,8 @@ makes sense whole.
   `start_relayed`) reuse the same pull protocol behind a handle. A
   `managed` task's `begin` receives a `Ledger`, and `adopt`/`adopt_leaf`
   on it publish owners while the run is live (a task may hold many; its
-  proof is the aggregate); `start_witnessed` runs with no consumer at all,
+  proof is the aggregate), and `adopt_under`/`adopt_leaf_under` stage a
+  child beneath a parent owner, asked only once the parent has exited; `start_witnessed` runs with no consumer at all,
   the scope's exit being the whole report, behind a `Witnessed` handle
   (`witness_pid`, `cancel_witnessed`); `cancel_when_exits` names a
   consumer whose death cancels. Depends on

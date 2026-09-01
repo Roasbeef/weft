@@ -788,3 +788,104 @@ pub fn a_pid_both_watched_and_adopted_answers_both_watches_test() -> Nil {
   assert weft.pull(detached, within: 5000) == AllDelivered
   assert await_exit(scope_exit) == process.Normal
 }
+
+// --- Owners published beneath a parent ---------------------------------------
+
+/// The ledger and a parked worker, for tests that adopt from outside.
+fn parked_run() -> #(weft.Detached(Nil, Nil), weft.Ledger) {
+  let handoff = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        process.send(handoff, ledger)
+        process.sleep_forever()
+        Ok(Nil)
+      }),
+    ])
+    |> weft.start_detached
+  let assert Ok(ledger) = process.receive(handoff, 2000)
+    as "the worker hands its ledger over"
+  #(detached, ledger)
+}
+
+pub fn a_child_is_asked_only_after_its_parent_exits_test() -> Nil {
+  let #(parent, parent_commands) = obedient_owner()
+  let #(child, child_commands) = obedient_owner()
+  let asked = process.new_subject()
+  let #(detached, ledger) = parked_run()
+
+  // The parent ignores its ask, so it stays alive across cancellation;
+  // the child's cancel records that it ran and then drains the child.
+  assert weft.adopt_leaf(ledger, owner: parent, cancel: deaf_cancel())
+    == weft.Adopted
+  assert weft.adopt_under(ledger, parent:, owner: child, cancel: fn() {
+      process.send(asked, Nil)
+      process.send(child_commands, DrainCleanly)
+    })
+    == weft.Adopted
+
+  weft.cancel_detached(detached)
+  assert process.receive(asked, 300) == Error(Nil)
+  assert process.is_alive(child)
+
+  // Only the parent's own exit reaches the child.
+  process.send(parent_commands, DrainCleanly)
+  assert process.receive(asked, 2000) == Ok(Nil)
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
+
+pub fn a_parents_exit_asks_its_children_without_any_cancellation_test() -> Nil {
+  let #(parent, parent_commands) = obedient_owner()
+  let #(child, child_commands) = obedient_owner()
+  let #(detached, ledger) = parked_run()
+
+  assert weft.adopt_leaf(ledger, owner: parent, cancel: deaf_cancel())
+    == weft.Adopted
+  assert weft.adopt_under(
+      ledger,
+      parent:,
+      owner: child,
+      cancel: drain_on_cancel(child_commands),
+    )
+    == weft.Adopted
+
+  // Nobody cancels the run. The parent finishing is what asks the child,
+  // and the child obeying is what lets the task settle once the worker
+  // does.
+  process.send(parent_commands, DrainCleanly)
+  let child_exit = watch_exit(child)
+  assert await_exit(child_exit) == process.Normal
+  weft.cancel_detached(detached)
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
+
+pub fn adopting_under_an_exited_parent_is_refused_and_asked_test() -> Nil {
+  let #(parent, parent_commands) = obedient_owner()
+  let #(child, child_commands) = obedient_owner()
+  let #(detached, ledger) = parked_run()
+
+  assert weft.adopt_leaf(ledger, owner: parent, cancel: deaf_cancel())
+    == weft.Adopted
+  let parent_exit = watch_exit(parent)
+  process.send(parent_commands, DrainCleanly)
+  assert await_exit(parent_exit) == process.Normal
+
+  // The scope has seen the parent go by the time this reply comes back,
+  // because the parent's DOWN precedes the publication in its mailbox
+  // only if it arrived first — so wait for the scope to have resolved
+  // it by asking through the same inbox after the exit was observed.
+  let child_exit = watch_exit(child)
+  assert weft.adopt_under(
+      ledger,
+      parent:,
+      owner: child,
+      cancel: drain_on_cancel(child_commands),
+    )
+    == weft.Refused
+  assert await_exit(child_exit) == process.Normal
+  weft.cancel_detached(detached)
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
