@@ -1,0 +1,21 @@
+name = "weft"
+version = "0.1.0"
+licences = ["Apache-2.0"]
+description = "Owned, bounded structured concurrency and the missing OTP behaviours, typed for Gleam."
+target = "erlang"
+
+gleam = ">= 1.18.0"
+
+repository = { type = "github", user = "Roasbeef", repo = "weft" }
+
+internal_modules = [
+  "weft/internal/*",
+]
+
+[dependencies]
+gleam_stdlib = ">= 0.60.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.3.0 and < 2.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
