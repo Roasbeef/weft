@@ -184,6 +184,83 @@ pub fn limit_bounds_how_many_tasks_run_at_once_test() {
   assert peak_concurrency(counter) == 2
 }
 
+// --- Deadlines --------------------------------------------------------------
+
+pub fn a_deadline_abandons_what_was_running_test() {
+  let account =
+    weft.new([fn() { Ok(0) }, sleeper(30_000, 1)])
+    |> weft.limit(2)
+    |> weft.deadline(80)
+    |> weft.start
+
+  assert account == [Completed(0, 0), Abandoned(1)]
+}
+
+pub fn a_deadline_never_starts_what_was_queued_test() {
+  let account =
+    weft.new([sleeper(30_000, 0), sleeper(30_000, 1)])
+    |> weft.limit(1)
+    |> weft.deadline(80)
+    |> weft.start
+
+  assert account == [Abandoned(0), NeverStarted(1)]
+}
+
+pub fn an_early_finish_leaves_no_stale_deadline_test() {
+  let first =
+    weft.new([fn() { Ok(0) }, fn() { Ok(1) }])
+    |> weft.deadline(40)
+    |> weft.start
+  assert first == [Completed(0, 0), Completed(1, 1)]
+
+  // Well past the point where the first run's timer would have fired. If the
+  // scope had left it armed, the message would have to land somewhere, and this
+  // process is the only place left for it to land.
+  process.sleep(90)
+
+  let second = weft.new([sleeper(30, 2)]) |> weft.start
+  assert second == [Completed(0, 2)]
+}
+
+// --- Cancellation from outside ----------------------------------------------
+
+pub fn a_cancel_signal_unblocks_a_caller_stuck_in_start_test() {
+  let stop = weft.cancel_signal()
+  let finished = process.new_subject()
+
+  let _harness =
+    process.spawn_unlinked(fn() {
+      let account =
+        weft.new(list.repeat(sleeper(30_000, 0), 3))
+        |> weft.limit(2)
+        |> weft.cancel_with(stop)
+        |> weft.start
+      process.send(finished, account)
+    })
+
+  // The harness is blocked inside `start` and cannot act on its own behalf,
+  // which is exactly the case a handle-based `cancel(task)` cannot reach.
+  process.sleep(60)
+  weft.cancel(stop)
+
+  let assert Ok(account) = process.receive(finished, 5000)
+    as "firing the signal must end the run"
+  assert account == [Abandoned(0), Abandoned(1), NeverStarted(2)]
+}
+
+pub fn a_spent_signal_starts_no_work_at_all_test() {
+  let stop = weft.cancel_signal()
+  weft.cancel(stop)
+  process.sleep(20)
+
+  let account =
+    weft.new([sleeper(30_000, 0), sleeper(30_000, 1)])
+    |> weft.cancel_with(stop)
+    |> weft.start
+
+  assert account == [NeverStarted(0), NeverStarted(1)]
+}
+
 // --- fold -------------------------------------------------------------------
 
 pub fn fold_sees_outcomes_in_completion_order_test() {

@@ -76,9 +76,10 @@
 ////
 //// ## Cancellation, and how `Abandoned` stays honest
 ////
-//// A run can be stopped from two directions so far: `on_failure(CancelSiblings)`
-//// when a task fails, and the caller dying under it. Both converge on
-//// `begin_cancel`.
+//// A run can be stopped from three directions: `on_failure(CancelSiblings)`
+//// when a task fails, `deadline` when the wall clock runs out, and
+//// `cancel_with` when some *other* process decides to end a run the caller is
+//// blocked inside. All three converge on `begin_cancel`.
 ////
 //// The scope cancels a worker with `process.kill`, so a cancelled worker's exit
 //// reason is `Killed` — and so is the exit reason of a worker some unrelated
@@ -179,15 +180,82 @@ pub type Step(acc) {
   )
 }
 
+// --- The cancel signal ------------------------------------------------------
+
+/// An external stop signal. Any process holding one can end a run that another
+/// process is blocked inside, which is the case a handle-based `cancel(task)`
+/// cannot reach: the caller is the thing that is blocked.
+///
+/// A signal is a tiny process that does nothing but stay alive. `cancel` kills
+/// it, and every scope watching it sees the death. That is why one signal can
+/// serve several runs at once, and why a signal is **one-shot**: a killed
+/// process cannot come back, so a `Cancel` that has fired stays fired. Handing a
+/// spent signal to `cancel_with` cancels that run immediately, before any task
+/// starts.
+pub opaque type Cancel {
+  Cancel(
+    /// The signal process. Its death is the signal.
+    pid: Pid,
+  )
+}
+
+/// Create a fresh cancel signal.
+///
+/// The returned value can be passed to `cancel_with` on any number of runs and
+/// shared with any number of processes. It costs one idle process, which lives
+/// until `cancel` is called on it.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let stop = weft.cancel_signal()
+///
+/// let outcomes =
+///   weft.new(tasks)
+///   |> weft.cancel_with(stop)
+///   |> weft.start
+/// ```
+pub fn cancel_signal() -> Cancel {
+  // Unlinked deliberately: the signal outlives the process that created it and
+  // must not take anybody down when it is fired.
+  Cancel(pid: process.spawn_unlinked(fn() { process.sleep_forever() }))
+}
+
+/// Fire a cancel signal, ending every run watching it.
+///
+/// Firing a signal that has already fired does nothing. Runs watching the
+/// signal report `Abandoned` for the tasks that were running and `NeverStarted`
+/// for the tasks that had not begun.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let stop = weft.cancel_signal()
+/// process.spawn(fn() { weft.new(tasks) |> weft.cancel_with(stop) |> weft.start })
+///
+/// // From any process, at any time, including while the run's caller is
+/// // blocked inside `start`:
+/// weft.cancel(stop)
+/// ```
+pub fn cancel(signal: Cancel) -> Nil {
+  process.kill(signal.pid)
+}
+
 // --- The builder ------------------------------------------------------------
 
 /// A configured run, not yet started.
 ///
-/// Built with `new` and refined with `limit` and `on_failure`; `start` and
-/// `fold` are the terminal verbs. A `Run` is an
+/// Built with `new` and refined with `limit`, `on_failure`, `cancel_with` and
+/// `deadline`; `start` and `fold` are the terminal verbs. A `Run` is an
 /// ordinary immutable value, so the same one can be started more than once.
 pub opaque type Run(a, e) {
-  Run(tasks: List(fn() -> Result(a, e)), limit: Int, on_failure: OnFailure)
+  Run(
+    tasks: List(fn() -> Result(a, e)),
+    limit: Int,
+    on_failure: OnFailure,
+    signal: Option(Cancel),
+    within: Option(Int),
+  )
 }
 
 /// Begin a run over `tasks`, bounded by default.
@@ -210,7 +278,13 @@ pub opaque type Run(a, e) {
 ///   |> weft.start
 /// ```
 pub fn new(tasks: List(fn() -> Result(a, e))) -> Run(a, e) {
-  Run(tasks:, limit: default_limit(), on_failure: KeepGoing)
+  Run(
+    tasks:,
+    limit: default_limit(),
+    on_failure: KeepGoing,
+    signal: None,
+    within: None,
+  )
 }
 
 /// Set how many tasks may occupy a slot at once.
@@ -247,6 +321,45 @@ pub fn limit(run: Run(a, e), max: Int) -> Run(a, e) {
 /// ```
 pub fn on_failure(run: Run(a, e), policy: OnFailure) -> Run(a, e) {
   Run(..run, on_failure: policy)
+}
+
+/// Watch a cancel signal for the duration of the run.
+///
+/// This is the only way to stop a run from outside the process that started it,
+/// because that process is blocked inside `start` or `fold` and cannot act on
+/// its own behalf.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let stop = weft.cancel_signal()
+///
+/// let outcomes =
+///   weft.new(tasks)
+///   |> weft.cancel_with(stop)
+///   |> weft.start
+/// ```
+pub fn cancel_with(run: Run(a, e), signal: Cancel) -> Run(a, e) {
+  Run(..run, signal: Some(signal))
+}
+
+/// Give the whole run a wall-clock budget, in milliseconds.
+///
+/// Hitting the deadline is not an error, it is a reason some entries in the
+/// account are `Abandoned` (started, then cut short) or `NeverStarted` (never
+/// got a slot). The timer is cancelled and flushed if the run finishes first,
+/// so it can never fire into a later receive.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new(tasks)
+///   |> weft.deadline(30_000)
+///   |> weft.start
+/// ```
+pub fn deadline(run: Run(a, e), within: Int) -> Run(a, e) {
+  Run(..run, within: Some(int.max(0, within)))
 }
 
 // --- Running ----------------------------------------------------------------
@@ -467,7 +580,7 @@ fn drive(
   initial: acc,
   reducer: fn(acc, Outcome(a, e)) -> Step(acc),
 ) -> #(acc, Option(ExitReason)) {
-  let Run(tasks:, limit:, on_failure:) = run
+  let Run(tasks:, limit:, on_failure:, signal:, within:) = run
   let indexed = list.index_map(tasks, fn(task, index) { #(index, task) })
   let outbox = process.new_subject()
   let caller = process.self()
@@ -476,7 +589,9 @@ fn drive(
   // first instruction. A caller that dies during the handshake is therefore
   // still a caller the scope will hear about.
   let scope =
-    process.spawn(fn() { run_scope(caller, outbox, indexed, limit, on_failure) })
+    process.spawn(fn() {
+      run_scope(caller, outbox, indexed, limit, on_failure, signal, within)
+    })
 
   let watch = process.monitor(scope)
   let replies =
@@ -559,6 +674,8 @@ type Event(a, e) {
   Reported(report: Report(a, e))
   Exited(pid: Pid, reason: ExitReason)
   Asked(request: Request)
+  DeadlinePassed
+  SignalLost
 }
 
 /// Where the caller is in the conversation. This is a four-state machine rather
@@ -590,8 +707,10 @@ type Scope(a, e) {
     outbox: Subject(Reply(a, e)),
     inbox: Subject(Request),
     reports: Subject(Report(a, e)),
+    alarm: Subject(Nil),
     events: process.Selector(Event(a, e)),
     on_failure: OnFailure,
+    timer: Option(process.Timer),
     /// Tasks that have not been spawned, in input order.
     pending: List(#(Int, fn() -> Result(a, e))),
     /// Spawned and unaccounted, keyed by pid because that is what an `EXIT`
@@ -616,6 +735,8 @@ fn run_scope(
   tasks: List(#(Int, fn() -> Result(a, e))),
   limit: Int,
   on_failure: OnFailure,
+  signal: Option(Cancel),
+  within: Option(Int),
 ) -> Nil {
   // Trapping first is what turns a worker crash into a `Crashed` outcome
   // instead of a dead scope, and what turns the caller's death into an event
@@ -624,14 +745,22 @@ fn run_scope(
 
   let inbox = process.new_subject()
   let reports = process.new_subject()
+  let alarm = process.new_subject()
+
+  let timer = case within {
+    None -> None
+    Some(milliseconds) -> Some(process.send_after(alarm, milliseconds, Nil))
+  }
 
   let events =
     process.new_selector()
     |> process.select_map(reports, Reported)
     |> process.select_map(inbox, Asked)
+    |> process.select_map(alarm, fn(_) { DeadlinePassed })
     |> process.select_trapped_exits(fn(exit: process.ExitMessage) {
       Exited(pid: exit.pid, reason: exit.reason)
     })
+    |> process.select_monitors(fn(_) { SignalLost })
 
   let scope =
     Scope(
@@ -639,8 +768,10 @@ fn run_scope(
       outbox:,
       inbox:,
       reports:,
+      alarm:,
       events:,
       on_failure:,
+      timer:,
       pending: tasks,
       running: [],
       finishing: [],
@@ -652,7 +783,31 @@ fn run_scope(
       cancelling: False,
     )
 
-  loop(scope)
+  loop(watch_signal(scope, signal))
+}
+
+/// Watch the cancel signal, and settle the one question the monitor alone
+/// cannot answer: whether the signal was already spent before the run began.
+///
+/// Monitoring rather than linking keeps the signal's death one-directional —
+/// firing a signal must end runs, never kill the processes watching them. But a
+/// `DOWN` for an already-dead pid arrives as a message, and `fill_slots` runs
+/// before the scope's first receive, so a spent signal would otherwise spawn
+/// every task only to kill it. Checking liveness here is the difference between
+/// a run that reports `NeverStarted` for everything and one that does the work
+/// twice over. The monitor still covers the pid that dies between these two
+/// lines.
+fn watch_signal(scope: Scope(a, e), signal: Option(Cancel)) -> Scope(a, e) {
+  case signal {
+    None -> scope
+    Some(Cancel(pid:)) -> {
+      let _watch = process.monitor(pid)
+      case process.is_alive(pid) {
+        True -> scope
+        False -> begin_cancel(scope)
+      }
+    }
+  }
 }
 
 /// Do everything that needs no message, then decide whether there is anything
@@ -740,6 +895,11 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
     Exited(pid:, reason:) -> note_exit(scope, pid, reason)
     Asked(request: Next) -> Scope(..scope, consumer: Waiting)
     Asked(request: Stop) -> detach(scope, Halted)
+    // Clearing the timer here is half of the flush: a timer that has fired
+    // cannot be cancelled, and `flush_deadline` must not go looking for a
+    // message this branch already consumed.
+    DeadlinePassed -> begin_cancel(Scope(..scope, timer: None))
+    SignalLost -> begin_cancel(scope)
   }
 }
 
@@ -870,6 +1030,8 @@ fn begin_cancel(scope: Scope(a, e)) -> Scope(a, e) {
 
 /// Say `Done`, drop the link, and let the process end.
 fn finish(scope: Scope(a, e)) -> Nil {
+  flush_deadline(scope)
+
   case scope.consumer {
     Gone -> Nil
     Waiting -> process.send(scope.outbox, Done)
@@ -882,6 +1044,26 @@ fn finish(scope: Scope(a, e)) -> Nil {
   // finish as unexpected mailbox noise. Doing it here, after the last thing
   // that could fail, leaves the link covering the entire run.
   process.unlink(scope.caller)
+}
+
+/// Cancel the deadline timer, and drain its message if it beat us to it.
+///
+/// The scope's mailbox dies with the scope, so nothing can leak out of this
+/// process; the flush is here so that the invariant holds where it is stated
+/// rather than by accident of the process ending, and so that a stale alarm can
+/// never be mistaken for a live one if this loop is ever given more to do.
+fn flush_deadline(scope: Scope(a, e)) -> Nil {
+  case scope.timer {
+    None -> Nil
+    Some(timer) ->
+      case process.cancel_timer(timer) {
+        process.Cancelled(_) -> Nil
+        process.TimerNotFound -> {
+          let _fired = process.receive(scope.alarm, 0)
+          Nil
+        }
+      }
+  }
 }
 
 // --- The delivery backlog ---------------------------------------------------
