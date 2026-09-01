@@ -103,6 +103,7 @@ import gleam/erlang/process.{type ExitReason, type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/set
 
 // --- The account ------------------------------------------------------------
@@ -458,6 +459,130 @@ pub fn fold(
 ) -> acc {
   let #(accumulator, _ending) = drive(run, initial, reducer)
   accumulator
+}
+
+// --- Sugar ------------------------------------------------------------------
+
+/// Apply a fallible function to every item, bounded, and return the account.
+///
+/// Exactly `weft.new` over the items with `limit` and `start`, which is the
+/// shape most callers want and the one it is easiest to get wrong by mapping an
+/// unbounded `async` over a list.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes = weft.map(urls, limit: 8, with: fetch)
+/// let #(bodies, rest) = weft.partition(outcomes)
+/// ```
+pub fn map(
+  items: List(a),
+  limit max: Int,
+  with fun: fn(a) -> Result(b, e),
+) -> List(Outcome(b, e)) {
+  items
+  |> list.map(fn(item) { fn() { fun(item) } })
+  |> new
+  |> limit(max)
+  |> start
+}
+
+/// Run tasks concurrently and return the first one to *complete*, however it
+/// completed. The losers are killed and joined before this returns.
+///
+/// The first task is a separate argument from the rest because a race over
+/// nothing has no answer: `Outcome` has no variant meaning "there was nothing to
+/// race", and wrapping the result in a `Result` would push an error case onto
+/// every call site that already knows its list is not empty. Making the empty
+/// case unrepresentable is cheaper than making every caller handle it. A caller
+/// holding a runtime list matches on it once and decides for itself what
+/// nothing should mean.
+///
+/// Note the difference from `first_ok`: this returns the first task to
+/// *finish*, even if it finished by failing or crashing. Conflating the two is a
+/// common bug, which is why they are separate functions.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // Whichever mirror answers first, even if it answers with an error.
+/// let outcome = weft.race(fn() { fetch(mirror_a) }, [fn() { fetch(mirror_b) }])
+/// // -> weft.Completed(index: 1, value: <-body->)
+/// ```
+pub fn race(
+  first: fn() -> Result(a, e),
+  rest: List(fn() -> Result(a, e)),
+) -> Outcome(a, e) {
+  let tasks = [first, ..rest]
+  let run = new(tasks) |> limit(list.length(tasks))
+
+  // Halting on the very first outcome is what cancels the losers: the scope
+  // kills and joins them before it answers, so no separate cancel-on-success
+  // policy is needed inside the engine.
+  let #(winner, ending) =
+    drive(run, None, fn(_, outcome) { Halt(Some(outcome)) })
+
+  case winner {
+    Some(outcome) -> outcome
+    // Unreachable while the scope is alive, since a run of at least one task
+    // always yields an outcome before it says `Done`. It is reachable if
+    // something outside the run kills the scope, and then the honest report is
+    // that the first task died the way the scope did.
+    None -> Crashed(index: 0, reason: option.unwrap(ending, process.Normal))
+  }
+}
+
+/// Run tasks concurrently and return the first one to *succeed*, falling back
+/// to the full account if none did. The losers are killed and joined before a
+/// success returns.
+///
+/// A `Failed` or `Crashed` task does not end the run here; that is the whole
+/// point of the function, and it is why `first_ok` leaves `on_failure` at
+/// `KeepGoing`. An empty list is answerable, unlike in `race`, because the error
+/// channel already exists: it yields `Error([])`.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let body = weft.first_ok([fn() { fetch(mirror_a) }, fn() { fetch(mirror_b) }])
+/// // -> Ok(<-body->)
+/// ```
+///
+/// ```gleam
+/// // Nothing succeeded, so the caller gets the whole account in input order.
+/// let answer = weft.first_ok([fn() { Error("a") }, fn() { Error("b") }])
+/// // -> Error([weft.Failed(0, "a"), weft.Failed(1, "b")])
+/// ```
+pub fn first_ok(
+  tasks: List(fn() -> Result(a, e)),
+) -> Result(a, List(Outcome(a, e))) {
+  let run = new(tasks) |> limit(int.max(1, list.length(tasks)))
+  let #(account, _ending) =
+    drive(run, [], fn(account, outcome) {
+      let account = [outcome, ..account]
+      case outcome {
+        Completed(..) -> Halt(account)
+        Failed(..) -> Continue(account)
+        Crashed(..) -> Continue(account)
+        Abandoned(..) -> Continue(account)
+        NeverStarted(..) -> Continue(account)
+      }
+    })
+
+  // The success, if there is one, is the outcome the reducer halted on, so it
+  // is at the head; the scan is over a list that is one element long in the
+  // happy case.
+  account
+  |> list.find_map(fn(outcome) {
+    case outcome {
+      Completed(value:, ..) -> Ok(value)
+      Failed(..) -> Error(Nil)
+      Crashed(..) -> Error(Nil)
+      Abandoned(..) -> Error(Nil)
+      NeverStarted(..) -> Error(Nil)
+    }
+  })
+  |> result.map_error(fn(_) { by_index(account) })
 }
 
 // --- Reading an account -----------------------------------------------------

@@ -314,7 +314,62 @@ pub fn a_halted_fold_cancels_and_reaps_the_rest_test() {
   assert dead_within(workers, 300)
 }
 
-// --- Reading an account -----------------------------------------------------
+// --- race and first_ok ------------------------------------------------------
+
+pub fn race_returns_the_first_task_to_finish_test() {
+  let outcome = weft.race(sleeper(200, 0), [sleeper(20, 1), sleeper(400, 2)])
+  assert outcome == Completed(1, 1)
+}
+
+pub fn race_reports_a_failure_that_got_there_first_test() {
+  // `race` is the first task to *complete*, not the first to succeed. Treating
+  // these as the same function is a common bug, so the difference is tested.
+  let outcome = weft.race(fn() { Error("fast") }, [sleeper(300, 1)])
+  assert outcome == Failed(0, "fast")
+}
+
+pub fn race_kills_the_losers_test() {
+  let reporter = process.new_subject()
+  let outcome =
+    weft.race(sleeper(60, 0), [
+      reporting_sleeper(reporter),
+      reporting_sleeper(reporter),
+    ])
+
+  assert outcome == Completed(0, 0)
+  let losers = collect_pids(reporter, 2, [])
+  assert dead_within(losers, 300)
+}
+
+pub fn first_ok_skips_a_failure_and_takes_a_later_success_test() {
+  let answer =
+    weft.first_ok([fn() { Error("no") }, sleeper(40, 7), sleeper(30_000, 9)])
+  assert answer == Ok(7)
+}
+
+pub fn first_ok_reports_the_whole_account_when_nothing_succeeds_test() {
+  let answer = weft.first_ok([fn() { Error("a") }, fn() { Error("b") }])
+  assert answer == Error([Failed(0, "a"), Failed(1, "b")])
+}
+
+pub fn first_ok_of_nothing_is_an_empty_account_test() {
+  let answer: Result(Int, List(Outcome(Int, String))) = weft.first_ok([])
+  assert answer == Error([])
+}
+
+// --- Sugar and accessors ----------------------------------------------------
+
+pub fn map_runs_the_function_over_every_item_test() {
+  let account =
+    weft.map([1, 2, 3], limit: 2, with: fn(n) {
+      case n == 2 {
+        True -> Error("two")
+        False -> Ok(n * 10)
+      }
+    })
+
+  assert account == [Completed(0, 10), Failed(1, "two"), Completed(2, 30)]
+}
 
 pub fn partition_keeps_order_and_preserves_everything_else_test() {
   let account = [
