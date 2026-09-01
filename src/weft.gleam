@@ -135,7 +135,8 @@
 //// `start_witnessed` is the run shape for a caller that wants only that
 //// witness: no outcomes are delivered, and the scope's pid — alive exactly
 //// while any worker, owner or cancel helper is, exiting with the verdict —
-//// is the whole report. `cancel_when_exits` names a consumer whose death
+//// is the whole report; the handle it returns carries that pid and
+//// `cancel_witnessed`. `cancel_when_exits` names a consumer whose death
 //// should end such a run when that consumer is not the caller.
 ////
 //// ## Cancellation, and how `Abandoned` stays honest
@@ -773,7 +774,7 @@ pub fn cancel_with(run: Run(a, e), signal: Cancel) -> Run(a, e) {
 /// ## Examples
 ///
 /// ```gleam
-/// let witness =
+/// let witnessed =
 ///   weft.new_prepared([weft.managed(serve)])
 ///   |> weft.cancel_when_exits(consumer)
 ///   |> weft.start_witnessed
@@ -1133,16 +1134,16 @@ pub fn scope_pid(detached: Detached(a, e)) -> Pid {
   detached.scope
 }
 
-/// Start a run whose only report is the scope's exit, and hand back the
-/// scope's pid.
+/// Start a run whose only report is the scope's exit, and hand back a
+/// handle carrying the scope's pid and cancellation.
 ///
 /// Nothing is delivered to anyone: each outcome is discarded the moment it
 /// is sealed, and its slot returned. What remains is the part a drain
 /// witness needs — the scope is alive exactly while any worker, any
 /// adopted owner, or any cancel helper is, and it exits normally only if
 /// every proof landed. This is the shape for a run started purely to
-/// *witness* work: the caller monitors the returned pid, cancels through a
-/// signal or `cancel_when_exits`, and reads the verdict off the `DOWN`.
+/// *witness* work: the caller monitors `witness_pid`, cancels with
+/// `cancel_witnessed`, and reads the verdict off the `DOWN`.
 ///
 /// The scope is linked to the caller, as every scope is: a dead caller
 /// cancels the run, the owners are asked to stop, and the scope drains
@@ -1152,18 +1153,67 @@ pub fn scope_pid(detached: Detached(a, e)) -> Pid {
 /// ## Examples
 ///
 /// ```gleam
-/// let scope =
+/// let witnessed =
 ///   weft.new_prepared([weft.managed(run_request)])
 ///   |> weft.cancel_when_exits(consumer)
 ///   |> weft.start_witnessed
 ///
-/// let watch = process.monitor(scope)
+/// let watch = process.monitor(weft.witness_pid(witnessed))
 /// // A normal DOWN proves everything the request started is gone.
 /// ```
-pub fn start_witnessed(run: Run(a, e)) -> Pid {
+pub fn start_witnessed(run: Run(a, e)) -> Witnessed {
   let outbox = process.new_subject()
   let caller = process.self()
-  process.spawn(fn() { run_scope(caller, outbox, run, Discarding) })
+  let scope = process.spawn(fn() { run_scope(caller, outbox, run, Discarding) })
+
+  // The same handshake `start_detached` makes: the scope's first word is
+  // `Ready`, and a scope that died first still yields a usable handle
+  // whose cancellation goes nowhere.
+  let watch = process.monitor(scope)
+  let hello =
+    process.new_selector()
+    |> process.select_map(outbox, FromScope)
+    |> process.select_specific_monitor(watch, scope_down)
+  let inbox = await_ready(hello)
+  process.demonitor_process(watch)
+
+  Witnessed(scope:, inbox:)
+}
+
+/// A handle to a witnessed run: the scope to monitor, and the one verb a
+/// witness-only caller still needs, cancellation.
+pub opaque type Witnessed {
+  Witnessed(
+    /// The scope process, whose exit is the run's whole report.
+    scope: Pid,
+    /// Where cancellation is sent.
+    inbox: Subject(Request),
+  )
+}
+
+/// The scope process behind a witnessed run: the pid to monitor, and the
+/// pid to publish as another run's owner.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let watch = process.monitor(weft.witness_pid(witnessed))
+/// ```
+pub fn witness_pid(witnessed: Witnessed) -> Pid {
+  witnessed.scope
+}
+
+/// Cancel a witnessed run. Idempotent, and harmless once the scope has
+/// exited: running tasks are killed, owners are asked to stop, and the
+/// scope drains before it exits with the verdict.
+///
+/// ## Examples
+///
+/// ```gleam
+/// weft.cancel_witnessed(witnessed)
+/// ```
+pub fn cancel_witnessed(witnessed: Witnessed) -> Nil {
+  process.send(witnessed.inbox, CancelRun)
 }
 
 /// Start a run and push every outcome to `sink` as an ordinary message,

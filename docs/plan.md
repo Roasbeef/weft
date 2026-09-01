@@ -13,7 +13,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
 | `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
-| `weft` dynamic adoption | loom#159 phase 2 | `0.3.0` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed`, `cancel_when_exits`; many owners per task |
+| `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.4.0` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.4.0), `cancel_when_exits`; many owners per task |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -111,7 +111,11 @@ managed tasks (#5) and is an additive minor: two new `Outcome` variants
 (`DrainProofLost`, `CancellationUnconfirmed`), so a consumer matching
 exhaustively on `Outcome` gains two arms and nothing else moves. `0.3.0`
 adds dynamic adoption, witnessed runs and `cancel_when_exits`, all
-additive: no existing signature or variant changes.
+additive: no existing signature or variant changes. `0.4.0` changes one
+signature published hours earlier: `start_witnessed` returns a
+`Witnessed` handle (`witness_pid`, `cancel_witnessed`) rather than a bare
+pid, because a witness-only caller still has to be able to cancel without
+paying a signal process per run.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`

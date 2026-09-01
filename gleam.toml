@@ -1,5 +1,5 @@
 name = "weft"
-version = "0.3.0"
+version = "0.4.0"
 licences = ["Apache-2.0"]
 description = "Owned, bounded structured concurrency and the missing OTP behaviours, typed for Gleam."
 target = "erlang"

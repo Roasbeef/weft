@@ -673,7 +673,7 @@ pub fn adoption_after_cancellation_is_refused_but_still_drained_test() -> Nil {
 pub fn a_witnessed_run_reports_only_through_its_exit_test() -> Nil {
   let #(owner, commands) = obedient_owner()
 
-  let scope =
+  let witnessed =
     weft.new_prepared([
       weft.managed(fn(ledger) {
         let assert weft.Adopted =
@@ -683,6 +683,7 @@ pub fn a_witnessed_run_reports_only_through_its_exit_test() -> Nil {
       }),
     ])
     |> weft.start_witnessed
+  let scope = weft.witness_pid(witnessed)
   let scope_exit = watch_exit(scope)
 
   // Nobody pulls, and nothing is owed: the scope stays alive for exactly as
@@ -694,10 +695,34 @@ pub fn a_witnessed_run_reports_only_through_its_exit_test() -> Nil {
   assert await_exit(scope_exit) == process.Normal
 }
 
+pub fn cancelling_a_witnessed_run_asks_its_owners_and_drains_test() -> Nil {
+  let #(owner, commands) = obedient_owner()
+
+  let witnessed =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: drain_on_cancel(commands))
+          as "the witnessed task adopts its owner"
+        process.sleep_forever()
+        Ok(Nil)
+      }),
+    ])
+    |> weft.start_witnessed
+  let scope_exit = watch_exit(weft.witness_pid(witnessed))
+
+  // The worker is parked forever; only cancellation can end this run, and
+  // it ends normally because the owner obeys its ask. The second cancel
+  // is the idempotence check.
+  weft.cancel_witnessed(witnessed)
+  weft.cancel_witnessed(witnessed)
+  assert await_exit(scope_exit) == process.Normal
+}
+
 pub fn a_witnessed_run_carries_a_lost_proof_in_its_exit_test() -> Nil {
   let #(owner, _commands) = obedient_owner()
 
-  let scope =
+  let witnessed =
     weft.new_prepared([
       weft.managed(fn(ledger) {
         let assert weft.Adopted =
@@ -707,7 +732,7 @@ pub fn a_witnessed_run_carries_a_lost_proof_in_its_exit_test() -> Nil {
       }),
     ])
     |> weft.start_witnessed
-  let scope_exit = watch_exit(scope)
+  let scope_exit = watch_exit(weft.witness_pid(witnessed))
 
   process.kill(owner)
   assert abnormal_named(await_exit(scope_exit), "weft_drain_proof_lost")

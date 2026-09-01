@@ -19,7 +19,8 @@ makes sense whole.
   `managed` task's `begin` receives a `Ledger`, and `adopt`/`adopt_leaf`
   on it publish owners while the run is live (a task may hold many; its
   proof is the aggregate); `start_witnessed` runs with no consumer at all,
-  the scope's exit being the whole report, and `cancel_when_exits` names a
+  the scope's exit being the whole report, behind a `Witnessed` handle
+  (`witness_pid`, `cancel_witnessed`); `cancel_when_exits` names a
   consumer whose death cancels. Depends on
   `gleam_erlang/process` and `internal/sys` (the scope answers the system
   plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
