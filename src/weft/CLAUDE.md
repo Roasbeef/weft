@@ -38,6 +38,11 @@ makes sense whole.
   state is the handler list; it has no loop of its own). Reaches into
   `weft/internal/sys` for exactly one thing: `warn`, so a dropped handler
   leaves a trace.
+- **Linkage** — `start` links by default, as OTP does; `unlinked` on the
+  actor and machine builders spawns without the link, for a process that
+  must neither die with its starter nor take it down (a guard started by
+  the consumer it serves). `supervised` ignores it: a supervisor always
+  links its children.
 - **`weft/poll`** — bounded synchronous polling in the caller's own
   process (`until` with an immediate first attempt, a last attempt at the
   deadline, `Fail` distinct from `Retry`). Owns no process; depends only

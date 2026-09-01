@@ -743,6 +743,8 @@ pub opaque type Builder(state, data, message, return) {
     /// Whether the machine traps exits, turning exit signals from linked
     /// processes into messages the loop can act on.
     trap_exits: Bool,
+    /// Whether `start` links the new process to its starter.
+    linkage: Linkage,
   )
 }
 
@@ -775,6 +777,7 @@ pub fn new(
     on_enter: None,
     name: None,
     trap_exits: False,
+    linkage: Linked,
   )
 }
 
@@ -814,6 +817,7 @@ pub fn new_with_initialiser(
     on_enter: None,
     name: None,
     trap_exits: False,
+    linkage: Linked,
   )
 }
 
@@ -900,6 +904,39 @@ pub fn named(
   Builder(..builder, name: Some(name))
 }
 
+/// Whether `start` links the new process to the process that started it.
+pub type Linkage {
+  /// The default, and what OTP does: the starter and the machine share
+  /// fate down a link, and a supervisor is that starter.
+  Linked
+
+  /// No link. The machine is started by a process that must neither die
+  /// with it nor take it down: a guard started from the consumer it
+  /// serves, a holder that must outlive the host that created it. The
+  /// starter still learns of a start failure through the acknowledgement,
+  /// and can monitor the pid it gets back for everything after.
+  Unlinked
+}
+
+/// Start the machine without linking it to its starter.
+///
+/// Consumers that need this otherwise pay for it with a throwaway
+/// process that starts the machine and exits, which leaves the machine
+/// linked to a corpse; this is that arrangement made a setting. Only
+/// `start` reads it — a supervisor always links its children, so
+/// `supervised` ignores it.
+///
+/// ## Examples
+///
+/// ```gleam
+/// builder |> sm.unlinked |> sm.start
+/// ```
+pub fn unlinked(
+  builder: Builder(state, data, message, return),
+) -> Builder(state, data, message, return) {
+  Builder(..builder, linkage: Unlinked)
+}
+
 /// Choose whether the machine traps exits.
 ///
 /// A trapping machine receives an exit signal from a linked process as a
@@ -953,8 +990,14 @@ pub fn start(
   let ack_subject = process.new_subject()
   let parent = process.self()
 
-  let child =
-    process.spawn(fn() { initialise_machine(builder, parent, ack_subject) })
+  let child = case builder.linkage {
+    Linked ->
+      process.spawn(fn() { initialise_machine(builder, parent, ack_subject) })
+    Unlinked ->
+      process.spawn_unlinked(fn() {
+        initialise_machine(builder, parent, ack_subject)
+      })
+  }
 
   // The monitor exists so that a child dying during initialisation is a
   // reported start failure rather than a wait for a timeout that will never

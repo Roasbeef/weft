@@ -744,3 +744,25 @@ pub fn an_initialiser_error_is_reported_as_init_failed_test() -> Nil {
 
   assert result == Error(otp_actor.InitFailed("no disk"))
 }
+
+// ------------------------------------------------------------ linkage
+
+pub fn an_unlinked_actor_survives_its_starters_crash_test() -> Nil {
+  let handoff = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let assert Ok(started) =
+      actor.new(0)
+      |> actor.on_message(counter_handler)
+      |> actor.unlinked
+      |> actor.start
+      as "the unlinked actor must start"
+    process.send(handoff, started.pid)
+    process.kill(process.self())
+  })
+  let assert Ok(pid) = process.receive(handoff, 2000)
+    as "the starter hands the actor's pid over"
+
+  process.sleep(50)
+  assert process.is_alive(pid)
+  process.kill(pid)
+}

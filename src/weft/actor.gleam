@@ -418,6 +418,8 @@ pub opaque type Builder(state, message, return) {
     /// Whether the actor traps exits, turning exit signals from linked
     /// processes into messages the loop can act on.
     trap_exits: Bool,
+    /// Whether `start` links the new process to its starter.
+    linkage: Linkage,
     /// Called on the way out, if the actor gets a chance. See `on_shutdown`
     /// for exactly when that is.
     on_shutdown: Option(fn(state, ExitReason) -> Nil),
@@ -456,6 +458,7 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     on_message: fn(state, _message) { continue(state) },
     name: None,
     trap_exits: False,
+    linkage: Linked,
     on_shutdown: None,
     hibernate_after: None,
     idle_timeout: None,
@@ -495,6 +498,7 @@ pub fn new_with_initialiser(
     on_message: fn(state, _message) { continue(state) },
     name: None,
     trap_exits: False,
+    linkage: Linked,
     on_shutdown: None,
     hibernate_after: None,
     idle_timeout: None,
@@ -538,6 +542,39 @@ pub fn named(
   name: process.Name(message),
 ) -> Builder(state, message, return) {
   Builder(..builder, name: Some(name))
+}
+
+/// Whether `start` links the new process to the process that started it.
+pub type Linkage {
+  /// The default, and what OTP does: the starter and the actor share
+  /// fate down a link, and a supervisor is that starter.
+  Linked
+
+  /// No link. The actor is started by a process that must neither die
+  /// with it nor take it down: a guard started from the consumer it
+  /// serves, a holder that must outlive the host that created it. The
+  /// starter still learns of a start failure through the acknowledgement,
+  /// and can monitor the pid it gets back for everything after.
+  Unlinked
+}
+
+/// Start the actor without linking it to its starter.
+///
+/// Consumers that need this otherwise pay for it with a throwaway
+/// process that starts the actor and exits, which leaves the actor
+/// linked to a corpse; this is that arrangement made a setting. Only
+/// `start` reads it — a supervisor always links its children, so
+/// `supervised` ignores it.
+///
+/// ## Examples
+///
+/// ```gleam
+/// builder |> actor.unlinked |> actor.start
+/// ```
+pub fn unlinked(
+  builder: Builder(state, message, return),
+) -> Builder(state, message, return) {
+  Builder(..builder, linkage: Unlinked)
 }
 
 /// Choose whether the actor traps exits.
@@ -709,8 +746,14 @@ pub fn start(
   let ack_subject = process.new_subject()
   let parent = process.self()
 
-  let child =
-    process.spawn(fn() { initialise_actor(builder, parent, ack_subject) })
+  let child = case builder.linkage {
+    Linked ->
+      process.spawn(fn() { initialise_actor(builder, parent, ack_subject) })
+    Unlinked ->
+      process.spawn_unlinked(fn() {
+        initialise_actor(builder, parent, ack_subject)
+      })
+  }
 
   // The monitor exists so that a child dying during initialisation is a
   // reported start failure rather than a wait for a timeout that will never
