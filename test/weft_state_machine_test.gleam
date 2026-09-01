@@ -808,3 +808,141 @@ pub fn an_initialiser_error_is_reported_as_init_failed_test() -> Nil {
 
   assert result == Error(otp_actor.InitFailed("no socket"))
 }
+
+// ------------------------------------------------- the connection manager
+
+/// The canonical gen_statem example, which is the example on issue #2 and
+/// the one that exercises postpone, the state timeout and the enter callback
+/// at once.
+type Link {
+  Connecting
+  Ready
+  Backoff
+}
+
+/// The wire events. `Attempt` is injected by the enter callback rather than
+/// sent by anyone, which is the point: every path into `Connecting` starts a
+/// dial, including the ones added later.
+type Wire {
+  Attempt
+  Retry
+  Request(body: String)
+  Served(reply: Subject(List(String)))
+}
+
+/// What the link carries across transitions: how many dials it has made, and
+/// what it has served.
+type Session {
+  Session(attempts: Int, served: List(String))
+}
+
+/// The handler, written as `case state, message` so that the compiler names
+/// every pair nobody has thought about. There is no catch-all arm anywhere
+/// in it, which is the whole argument for a state ADT over a state atom.
+fn link_handler(
+  state: Link,
+  data: Session,
+  message: Wire,
+) -> sm.Next(Link, Session, Wire) {
+  case state, message {
+    // A request that arrives before the link is up is neither an error nor a
+    // special case: it waits inside the machine and is redelivered the
+    // instant we reach Ready, in the order it arrived. The report waits with
+    // it, so the caller sees a settled link rather than an empty one.
+    Connecting, Request(..)
+    | Backoff, Request(..)
+    | Connecting, Served(..)
+    | Backoff, Served(..)
+    -> sm.keep(data) |> sm.postpone
+
+    // The first dial fails and the second succeeds. What is being tested is
+    // the shape of the transitions, not a network.
+    Connecting, Attempt -> {
+      let data = Session(..data, attempts: data.attempts + 1)
+      case data.attempts == 1 {
+        True -> sm.transition(to: Backoff, data:)
+        False -> sm.transition(to: Ready, data:)
+      }
+    }
+
+    Backoff, Retry -> sm.transition(to: Connecting, data:)
+
+    Ready, Request(body:) ->
+      sm.keep(Session(..data, served: [body, ..data.served]))
+
+    Ready, Served(reply:) -> {
+      process.send(reply, list.reverse(data.served))
+      sm.keep(data)
+    }
+
+    // The pairs that cannot arise still have to be written down. That is the
+    // exhaustiveness, and it is why adding a fourth state variant would stop
+    // this file compiling until somebody decided what it means.
+    Connecting, Retry | Ready, Retry | Ready, Attempt | Backoff, Attempt ->
+      sm.keep(data)
+  }
+}
+
+/// The enter callback: the effects that belong to arriving in a state rather
+/// than to the event that got us there.
+fn link_enter(
+  _from: Link,
+  to: Link,
+  data: Session,
+) -> sm.Enter(Link, Session, Wire) {
+  case to {
+    Connecting -> sm.keep(data) |> sm.then_handle(Attempt)
+
+    // The retry is a state timeout, so it dies with the state: a stale Retry
+    // can never be handled once something else has moved us out of Backoff.
+    Backoff -> sm.keep(data) |> sm.with_state_timeout(after: 20, sending: Retry)
+
+    Ready -> sm.keep(data)
+  }
+}
+
+pub fn the_connection_manager_serves_queued_requests_in_order_test() -> Nil {
+  let assert Ok(started) =
+    sm.new_with_initialiser(1000, fn(subject) {
+      // Three requests, all of them in the mailbox before the machine has
+      // handled anything at all: the queueing is not a race the test has to
+      // win.
+      process.send(subject, Request("one"))
+      process.send(subject, Request("two"))
+      process.send(subject, Request("three"))
+      sm.initialised(Connecting, Session(attempts: 0, served: []))
+      |> sm.returning(subject)
+      |> Ok
+    })
+    |> sm.on_event(link_handler)
+    |> sm.on_enter(link_enter)
+    |> sm.start
+    as "the machine must start"
+
+  // The initial enter call dials, the first dial fails into Backoff, the
+  // requests pile up postponed, the state timeout retries, and the second
+  // dial reaches Ready — where all three are replayed in arrival order.
+  assert sm.call(started.data, waiting: 1000, sending: Served)
+    == ["one", "two", "three"]
+
+  discard(started.pid)
+}
+
+pub fn the_connection_manager_reaches_ready_test() -> Nil {
+  let assert Ok(started) =
+    sm.new(Connecting, Session(attempts: 0, served: []))
+    |> sm.on_event(link_handler)
+    |> sm.on_enter(link_enter)
+    |> sm.start
+    as "the machine must start"
+
+  // Nothing external drives this: the enter callback dials, the state
+  // timeout retries, and the machine settles in Ready on its own.
+  process.sleep(200)
+  let raw = system.get_state(started.pid)
+  let assert Ok(state) = decode.run(raw, decode.at([0], atom.decoder()))
+    as "the link's state is a nullary variant, so an atom"
+  assert atom.to_string(state) == "ready"
+
+  discard(started.pid)
+}
