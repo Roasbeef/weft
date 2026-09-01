@@ -114,6 +114,30 @@
 //// owner propagates a lost proof without either side writing translation
 //// code.
 ////
+//// ## Owners discovered while the task runs
+////
+//// `prepared_task` names its owner before the run starts. Work that only
+//// learns its owners as it goes — a request worker that prepares a
+//// transport and discovers the pid holding the socket — uses `managed`:
+//// its `begin` receives a `Ledger`, and `adopt` or `adopt_leaf` on it
+//// publishes one more owner to the scope, synchronously, with the same
+//// parked-work rule as before (adopt first, release on `Adopted`). A task
+//// may hold any number of owners; it is drained only when all of them are,
+//// and lost as soon as any one is. The ledger is a value and travels, so a
+//// process the worker started can publish on the worker's behalf.
+////
+//// A late publication — one that arrives after cancellation began, or for
+//// a task whose account is already written — is `Refused`, but the owner
+//// is retained and asked to stop all the same. Refusal withholds the
+//// permit to start new work; it never withholds the witness, because an
+//// owner that exists must be drained whatever the run's state.
+////
+//// `start_witnessed` is the run shape for a caller that wants only that
+//// witness: no outcomes are delivered, and the scope's pid — alive exactly
+//// while any worker, owner or cancel helper is, exiting with the verdict —
+//// is the whole report. `cancel_when_exits` names a consumer whose death
+//// should end such a run when that consumer is not the caller.
+////
 //// ## Cancellation, and how `Abandoned` stays honest
 ////
 //// A run can be stopped from three directions: `on_failure(CancelSiblings)`
@@ -396,6 +420,35 @@ pub opaque type PreparedTask(a, e) {
     role: OwnerRole,
     begin: fn() -> Result(a, e),
   )
+
+  /// A task that discovers its owners as it runs and publishes each one
+  /// through the ledger `begin` receives.
+  LedgeredTask(begin: fn(Ledger) -> Result(a, e))
+}
+
+/// A running managed task's capability to publish owners to its scope.
+///
+/// Handed to the `begin` of a task built with `managed`. It may be sent to
+/// any process — the worker that received it, or a process the worker
+/// started and wants witnessed — and `adopt`/`adopt_leaf` on it are
+/// synchronous with the scope. The index rides inside so an adoption is
+/// charged to the task that discovered the owner, and the scope pid rides
+/// inside so a caller can tell a refusal from a scope that is already gone.
+pub opaque type Ledger {
+  Ledger(scope: Pid, inbox: Subject(Request), index: Int)
+}
+
+/// The scope's answer to an adoption.
+pub type Adoption {
+  /// Custody crossed: the scope holds the owner under monitor and will
+  /// wait for its exit. The caller may let the owner's work begin.
+  Adopted
+
+  /// The run is cancelling, already sealed this task, or the scope is
+  /// gone. The owner is **still retained and asked to stop** when a scope
+  /// is there to do so — refusal withholds the permit to begin new work,
+  /// never the witness — but the caller must not start anything under it.
+  Refused
 }
 
 /// Prepare a plain task: no owner, no drain obligation, exactly the
@@ -474,6 +527,110 @@ pub fn prepared_leaf(
   OwnedTask(owner:, cancel:, role: Leaf, begin:)
 }
 
+/// Prepare a managed task whose owners are discovered while it runs.
+///
+/// This is `prepared_task` for work whose owners do not exist yet when the
+/// run starts: a request worker that prepares a transport, learns the pid
+/// holding its socket, and must have that pid witnessed *before* the socket
+/// is allowed to open. `begin` receives a `Ledger`; every `adopt` or
+/// `adopt_leaf` on it publishes one more owner to the scope, and the task's
+/// slot is held and its outcome withheld until the worker and **every**
+/// adopted owner have exited. A task that adopts nothing behaves exactly
+/// like `task`.
+///
+/// Publication is the parked-work pattern applied mid-run: prepare the
+/// owner parked, adopt it, and release it only on `Adopted`. A `Refused`
+/// means the run is already cancelling — the scope retains the owner and
+/// asks it to stop, so nothing leaks, but the caller must not begin the
+/// work.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let outcomes =
+///   weft.new_prepared([
+///     weft.managed(fn(ledger) {
+///       let #(owner, cancel, release) = prepare(request)
+///       case weft.adopt(ledger, owner:, cancel:) {
+///         weft.Adopted -> Ok(release())
+///         weft.Refused -> Error(Cancelled)
+///       }
+///     }),
+///   ])
+///   |> weft.start
+/// ```
+pub fn managed(begin: fn(Ledger) -> Result(a, e)) -> PreparedTask(a, e) {
+  LedgeredTask(begin:)
+}
+
+/// Publish a transitive owner to a running managed task's scope.
+///
+/// Only a *normal* exit of `owner` will prove its subtree drained; any
+/// other exit settles the task as `DrainProofLost`. Synchronous: returns
+/// once the scope has the owner under monitor, or `Refused` at once if the
+/// scope has already exited. May be called from any process holding the
+/// ledger, any number of times, for as many owners as the task discovers.
+///
+/// ## Examples
+///
+/// ```gleam
+/// case weft.adopt(ledger, owner: http_owner, cancel: stop_http) {
+///   weft.Adopted -> begin_http()
+///   weft.Refused -> Nil
+/// }
+/// ```
+pub fn adopt(
+  ledger: Ledger,
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+) -> Adoption {
+  publish(ledger, owner, Transitive, cancel)
+}
+
+/// Publish a leaf owner to a running managed task's scope: an owner that
+/// provably owns nothing further, completed by any exit. The `prepared_leaf`
+/// exemption, for owners discovered mid-run.
+///
+/// ## Examples
+///
+/// ```gleam
+/// case weft.adopt_leaf(ledger, owner: pump, cancel: stop_pump) {
+///   weft.Adopted -> start_pump()
+///   weft.Refused -> Nil
+/// }
+/// ```
+pub fn adopt_leaf(
+  ledger: Ledger,
+  owner owner: Pid,
+  cancel cancel: fn() -> Nil,
+) -> Adoption {
+  publish(ledger, owner, Leaf, cancel)
+}
+
+/// The adoption round trip. The scope's death is raced against its reply
+/// so a caller can never hang on a witness that no longer exists; the
+/// monitor is per call and flushed, so no stale `DOWN` survives it.
+fn publish(
+  ledger: Ledger,
+  owner: Pid,
+  role: OwnerRole,
+  cancel: fn() -> Nil,
+) -> Adoption {
+  let reply = process.new_subject()
+  let watch = process.monitor(ledger.scope)
+  process.send(
+    ledger.inbox,
+    Publish(index: ledger.index, owner:, role:, cancel:, reply:),
+  )
+  let answer =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(watch, fn(_down) { Refused })
+    |> process.selector_receive_forever()
+  process.demonitor_process(watch)
+  answer
+}
+
 // --- The builder ------------------------------------------------------------
 
 /// A configured run, not yet started.
@@ -488,6 +645,8 @@ pub opaque type Run(a, e) {
     limit: Int,
     on_failure: OnFailure,
     signal: Option(Cancel),
+    /// Processes whose exit cancels the run, from `cancel_when_exits`.
+    watched: List(Pid),
     within: Option(Int),
     grace: Option(Int),
   )
@@ -540,6 +699,7 @@ pub fn new_prepared(tasks: List(PreparedTask(a, e))) -> Run(a, e) {
     limit: default_limit(),
     on_failure: KeepGoing,
     signal: None,
+    watched: [],
     within: None,
     grace: None,
   )
@@ -599,6 +759,27 @@ pub fn on_failure(run: Run(a, e), policy: OnFailure) -> Run(a, e) {
 /// ```
 pub fn cancel_with(run: Run(a, e), signal: Cancel) -> Run(a, e) {
   Run(..run, signal: Some(signal))
+}
+
+/// Cancel the run when `pid` exits, for any reason.
+///
+/// This is the consumer's death made a cancellation cause without the
+/// consumer having to be the process that started the run: a stream whose
+/// receiver is gone has nobody to deliver to and should stop its work. The
+/// watch is a monitor, never a link, so firing it ends the run and touches
+/// nothing else. A pid already dead when the run starts cancels it before
+/// any task is spawned, exactly like a spent cancel signal.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let witness =
+///   weft.new_prepared([weft.managed(serve)])
+///   |> weft.cancel_when_exits(consumer)
+///   |> weft.start_witnessed
+/// ```
+pub fn cancel_when_exits(run: Run(a, e), pid: Pid) -> Run(a, e) {
+  Run(..run, watched: [pid, ..run.watched])
 }
 
 /// Give the whole run a wall-clock budget, in milliseconds.
@@ -952,6 +1133,39 @@ pub fn scope_pid(detached: Detached(a, e)) -> Pid {
   detached.scope
 }
 
+/// Start a run whose only report is the scope's exit, and hand back the
+/// scope's pid.
+///
+/// Nothing is delivered to anyone: each outcome is discarded the moment it
+/// is sealed, and its slot returned. What remains is the part a drain
+/// witness needs — the scope is alive exactly while any worker, any
+/// adopted owner, or any cancel helper is, and it exits normally only if
+/// every proof landed. This is the shape for a run started purely to
+/// *witness* work: the caller monitors the returned pid, cancels through a
+/// signal or `cancel_when_exits`, and reads the verdict off the `DOWN`.
+///
+/// The scope is linked to the caller, as every scope is: a dead caller
+/// cancels the run, the owners are asked to stop, and the scope drains
+/// before it exits. Use `cancel_when_exits` to name a consumer that is not
+/// the caller.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let scope =
+///   weft.new_prepared([weft.managed(run_request)])
+///   |> weft.cancel_when_exits(consumer)
+///   |> weft.start_witnessed
+///
+/// let watch = process.monitor(scope)
+/// // A normal DOWN proves everything the request started is gone.
+/// ```
+pub fn start_witnessed(run: Run(a, e)) -> Pid {
+  let outbox = process.new_subject()
+  let caller = process.self()
+  process.spawn(fn() { run_scope(caller, outbox, run, Discarding) })
+}
+
 /// Start a run and push every outcome to `sink` as an ordinary message,
 /// from a relay process this function spawns and returns.
 ///
@@ -1267,6 +1481,16 @@ type Request {
   /// handle's cancellation: unlike `Stop`, the caller still wants to hear
   /// what happened to every task.
   CancelRun
+
+  /// A managed task publishing an owner it discovered. Answered at once
+  /// with whether custody crossed; the owner is retained either way.
+  Publish(
+    index: Int,
+    owner: Pid,
+    role: OwnerRole,
+    cancel: fn() -> Nil,
+    reply: Subject(Adoption),
+  )
 }
 
 /// What the caller's receive can produce. The monitor arm exists so that a
@@ -1479,6 +1703,10 @@ type Consumer {
   Halted
   /// Dead. Nothing to report to, and nothing left to do but reap workers.
   Gone
+  /// Nobody is listening by design (`start_witnessed`): every sealed
+  /// outcome is dropped and its slot returned. Unlike `Halted` and `Gone`
+  /// the run itself is not over — only its account is unwanted.
+  Discarding
 }
 
 /// The scope's whole state.
@@ -1505,8 +1733,9 @@ type Scope(a, e) {
     timer: Option(process.Timer),
     grace: Option(Int),
     grace_timer: Option(process.Timer),
-    /// Tasks that have not been spawned, in input order.
-    pending: List(#(Int, fn() -> Result(a, e))),
+    /// Tasks that have not been spawned, in input order. Every task takes
+    /// the ledger; a plain one ignores it.
+    pending: List(#(Int, fn(Ledger) -> Result(a, e))),
     /// Spawned and unaccounted, keyed by pid because that is what an `EXIT`
     /// gives us.
     running: List(#(Pid, Int)),
@@ -1524,9 +1753,12 @@ type Scope(a, e) {
     /// bookkeeping, not outcomes, but the scope will not return while one
     /// is alive.
     helpers: List(Pid),
-    /// The cancel signal's pid, so its `DOWN` can be told apart from an
-    /// owner's.
-    signal_pid: Option(Pid),
+    /// The cancel signal's pid and every `cancel_when_exits` pid, so their
+    /// `DOWN`s can be told apart from an owner's.
+    signal_pids: List(Pid),
+    /// Indices whose outcome has been sealed and queued. Consulted so a
+    /// second owner resolving for the same task cannot report it twice.
+    sealed: set.Set(Int),
     /// Free slots. Taken at spawn, returned at delivery. Not consulted once
     /// `cancelling` is `True`, since nothing new is spawned after that.
     slots: Int,
@@ -1552,7 +1784,7 @@ fn run_scope(
   // this process can act on rather than a signal that kills it mid-teardown.
   process.trap_exits(True)
 
-  let Run(tasks:, limit:, on_failure:, signal:, within:, grace:) = run
+  let Run(tasks:, limit:, on_failure:, signal:, watched:, within:, grace:) = run
   let indexed =
     list.index_map(tasks, fn(prepared, index) { #(index, prepared) })
 
@@ -1617,7 +1849,8 @@ fn run_scope(
       awaiting: [],
       owners:,
       helpers: [],
-      signal_pid: None,
+      signal_pids: [],
+      sealed: set.new(),
       slots: limit,
       consumer:,
       cancelling: False,
@@ -1625,21 +1858,37 @@ fn run_scope(
       plane: sys.new(module: "weft", parent: caller),
     )
 
-  loop(watch_signal(scope, signal))
+  loop(watch_pids(watch_signal(scope, signal), watched))
+}
+
+/// Watch every `cancel_when_exits` pid the same way the signal is watched:
+/// by monitor, with the liveness check that a queued `noproc` cannot beat
+/// `fill_slots` to.
+fn watch_pids(scope: Scope(a, e), watched: List(Pid)) -> Scope(a, e) {
+  list.fold(watched, scope, fn(scope, pid) {
+    let _watch = process.monitor(pid)
+
+    let scope = Scope(..scope, signal_pids: [pid, ..scope.signal_pids])
+    case process.is_alive(pid) {
+      True -> scope
+      False -> begin_cancel(scope)
+    }
+  })
 }
 
 /// Split prepared tasks into the owner ledger and the spawn queue, taking
 /// out a monitor on every owner as it passes.
 fn adopt_owners(
   tasks: List(#(Int, PreparedTask(a, e))),
-) -> #(List(OwnerSlot), List(#(Int, fn() -> Result(a, e)))) {
+) -> #(List(OwnerSlot), List(#(Int, fn(Ledger) -> Result(a, e)))) {
   let #(owners, pending) =
     list.fold(tasks, #([], []), fn(split, entry) {
       let #(owners, pending) = split
       let #(index, prepared) = entry
 
       case prepared {
-        PlainTask(begin:) -> #(owners, [#(index, begin), ..pending])
+        PlainTask(begin:) -> #(owners, [#(index, ignoring(begin)), ..pending])
+        LedgeredTask(begin:) -> #(owners, [#(index, begin), ..pending])
 
         OwnedTask(owner:, cancel:, role:, begin:) -> {
           let monitor = process.monitor(owner)
@@ -1655,7 +1904,7 @@ fn adopt_owners(
           // no exit of its own to settle it: the `DOWN` must settle it as
           // lost even for a leaf, or the account would come up one short.
           let #(proof, pending) = case process.is_alive(owner) {
-            True -> #(ProofPending, [#(index, begin), ..pending])
+            True -> #(ProofPending, [#(index, ignoring(begin)), ..pending])
             False -> #(ProofAbsent, pending)
           }
           let slot =
@@ -1674,6 +1923,11 @@ fn adopt_owners(
     })
 
   #(owners, list.reverse(pending))
+}
+
+/// Lift a plain `begin` to the ledgered shape every pending entry has.
+fn ignoring(begin: fn() -> Result(a, e)) -> fn(Ledger) -> Result(a, e) {
+  fn(_ledger) { begin() }
 }
 
 /// Sort a generic monitor `DOWN` into the event vocabulary. Ports are
@@ -1702,7 +1956,7 @@ fn watch_signal(scope: Scope(a, e), signal: Option(Cancel)) -> Scope(a, e) {
     Some(Cancel(pid:)) -> {
       let _watch = process.monitor(pid)
 
-      let scope = Scope(..scope, signal_pid: Some(pid))
+      let scope = Scope(..scope, signal_pids: [pid, ..scope.signal_pids])
       case process.is_alive(pid) {
         True -> scope
         False -> begin_cancel(scope)
@@ -1766,7 +2020,8 @@ fn fill_slots(scope: Scope(a, e)) -> Scope(a, e) {
   case scope.pending {
     [] -> scope
     [#(index, task), ..rest] -> {
-      let worker = spawn_worker(scope.reports, index, task)
+      let ledger = Ledger(scope: process.self(), inbox: scope.inbox, index:)
+      let worker = spawn_worker(scope.reports, ledger, task)
       fill_slots(
         Scope(..scope, pending: rest, slots: scope.slots - 1, running: [
           #(worker, index),
@@ -1785,8 +2040,8 @@ fn fill_slots(scope: Scope(a, e)) -> Scope(a, e) {
 /// a message it would have to be alive to read.
 fn spawn_worker(
   reports: Subject(Report(a, e)),
-  index: Int,
-  task: fn() -> Result(a, e),
+  ledger: Ledger,
+  task: fn(Ledger) -> Result(a, e),
 ) -> Pid {
   process.spawn(fn() {
     // The report is delivered before this process's own EXIT, because messages
@@ -1795,7 +2050,7 @@ fn spawn_worker(
     // `running` when its EXIT arrives never answered.
     process.send(
       reports,
-      Report(worker: process.self(), index:, result: task()),
+      Report(worker: process.self(), index: ledger.index, result: task(ledger)),
     )
   })
 }
@@ -1823,6 +2078,8 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
       Scope(..scope, consumer: note_demand(scope.consumer))
     Asked(request: Stop) -> detach(scope, Halted)
     Asked(request: CancelRun) -> begin_cancel(scope)
+    Asked(request: Publish(index:, owner:, role:, cancel:, reply:)) ->
+      adopt_published(scope, index, owner, role, cancel, reply)
 
     // Clearing the timer here is half of the flush: a timer that has fired
     // cannot be cancelled, and `flush_deadline` must not go looking for a
@@ -1855,6 +2112,55 @@ fn note_demand(consumer: Consumer) -> Consumer {
     Busy -> Waiting
     Halted -> Halted
     Gone -> Gone
+    Discarding -> Discarding
+  }
+}
+
+/// A managed task published an owner mid-run.
+///
+/// The owner is monitored and retained whatever the answer: refusing
+/// custody withholds the permit to begin new work, never the witness, so a
+/// worker that publishes after cancellation still gets its owner asked to
+/// stop and waited for. Custody crosses only while the run is live and the
+/// task is not yet sealed — an owner published for a task whose account is
+/// already written cannot change that account, but it can still be drained.
+fn adopt_published(
+  scope: Scope(a, e),
+  index: Int,
+  owner: Pid,
+  role: OwnerRole,
+  cancel: fn() -> Nil,
+  reply: Subject(Adoption),
+) -> Scope(a, e) {
+  let monitor = process.monitor(owner)
+  let slot =
+    OwnerSlot(
+      index:,
+      pid: owner,
+      monitor:,
+      role:,
+      cancel:,
+      proof: ProofPending,
+      canceller: None,
+    )
+  let scope = Scope(..scope, owners: [slot, ..scope.owners])
+
+  let refused = scope.cancelling || set.contains(scope.sealed, index)
+  case refused {
+    False -> {
+      process.send(reply, Adopted)
+      scope
+    }
+    True -> {
+      process.send(reply, Refused)
+
+      // A run that is already cancelling has dispatched its cancels; this
+      // owner arrived after that fan-out, so it gets its own ask now.
+      case scope.cancelling {
+        True -> dispatch_cancels(scope)
+        False -> scope
+      }
+    }
   }
 }
 
@@ -1864,9 +2170,10 @@ fn note_watched_down(
   pid: Pid,
   reason: ExitReason,
 ) -> Scope(a, e) {
-  use <- bool.lazy_guard(when: Some(pid) == scope.signal_pid, return: fn() {
-    begin_cancel(scope)
-  })
+  use <- bool.lazy_guard(
+    when: list.contains(scope.signal_pids, pid),
+    return: fn() { begin_cancel(scope) },
+  )
   resolve_owner(scope, pid, reason)
 }
 
@@ -1961,17 +2268,26 @@ fn worsen_to_unconfirmed(verdict: Verdict) -> Verdict {
 
 /// Act on a freshly resolved proof: release a withheld outcome, or reach
 /// forward into work that has not settled yet.
+///
+/// The proof consulted is the task's *aggregate* over every owner it has,
+/// not the one that just resolved: a task with two owners is drained only
+/// when both are, while one lost owner loses the task at once. A task
+/// already sealed is left alone, which is what keeps a second owner's
+/// resolution from writing the account twice.
 fn apply_proof(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
-  case list.key_pop(scope.awaiting, slot.index) {
-    // The worker already settled and its outcome was withheld on this very
-    // proof; seal and queue it.
-    Ok(#(outcome, awaiting)) ->
-      queue_outcome(
-        Scope(..scope, awaiting:),
-        seal_outcome(outcome, slot.proof),
-      )
+  use <- bool.guard(when: set.contains(scope.sealed, slot.index), return: scope)
+  let proof = aggregate_proof(scope.owners, slot.index)
+  case list.key_pop(scope.awaiting, slot.index), proof {
+    // The worker already settled and its outcome was withheld; a resolved
+    // aggregate seals and queues it, a pending one keeps waiting.
+    Ok(#(outcome, awaiting)), ProofDrained
+    | Ok(#(outcome, awaiting)), ProofLost(..)
+    | Ok(#(outcome, awaiting)), ProofUnconfirmed
+    -> queue_outcome(Scope(..scope, awaiting:), seal_outcome(outcome, proof))
+    Ok(_withheld), ProofPending -> scope
+    Ok(_withheld), ProofAbsent -> scope
 
-    Error(Nil) -> reach_forward(scope, slot)
+    Error(Nil), proof -> reach_forward(scope, slot.index, proof)
   }
 }
 
@@ -1980,16 +2296,16 @@ fn apply_proof(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
 /// forward: an unstarted `begin` must never run under a dead witness, and a
 /// running worker's continued work is unsupervisable, so it is killed and
 /// its exit settles through the ordinary path.
-fn reach_forward(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
-  case slot.proof {
+fn reach_forward(scope: Scope(a, e), index: Int, proof: Proof) -> Scope(a, e) {
+  case proof {
     ProofLost(reason:) ->
-      case list.key_pop(scope.pending, slot.index) {
+      case list.key_pop(scope.pending, index) {
         Ok(#(_begin, pending)) ->
           queue_outcome(
             Scope(..scope, pending:),
-            DrainProofLost(index: slot.index, reason:),
+            DrainProofLost(index:, reason:),
           )
-        Error(Nil) -> settle_lost_worker(scope, slot.index, reason)
+        Error(Nil) -> settle_lost_worker(scope, index, reason)
       }
 
     ProofPending -> scope
@@ -1997,6 +2313,27 @@ fn reach_forward(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
     ProofDrained -> scope
     ProofUnconfirmed -> scope
   }
+}
+
+/// The proof a task's whole owner set has established. Loss outranks an
+/// unconfirmed cancellation, which outranks anything still pending, which
+/// outranks a clean drain — so a task is drained only when every owner is,
+/// and lost as soon as any one is. `None` is a task with no owners at all.
+fn aggregate_proof(owners: List(OwnerSlot), index: Int) -> Proof {
+  list.fold(owners, ProofDrained, fn(sum, slot) {
+    use <- bool.guard(when: slot.index != index, return: sum)
+    case sum, slot.proof {
+      ProofLost(..), _proof -> sum
+      _sum, ProofLost(reason:) -> ProofLost(reason:)
+      ProofUnconfirmed, _proof -> sum
+      _sum, ProofUnconfirmed -> ProofUnconfirmed
+      ProofPending, _proof -> sum
+      ProofAbsent, _proof -> sum
+      _sum, ProofPending -> ProofPending
+      _sum, ProofAbsent -> ProofAbsent
+      ProofDrained, ProofDrained -> ProofDrained
+    }
+  })
 }
 
 /// A proof was lost for a task that is neither pending nor withheld. A
@@ -2163,6 +2500,12 @@ fn classify_exit(
 /// resolved one seals it — the worker's own answer where the drain was
 /// proven, `DrainProofLost` or `CancellationUnconfirmed` where it was not.
 fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
+  // A task sealed by a lost proof has its account written; the worker's
+  // later exit is bookkeeping, not a second entry.
+  use <- bool.guard(
+    when: set.contains(scope.sealed, outcome.index),
+    return: scope,
+  )
   case proof_for(scope.owners, outcome.index) {
     None -> queue_outcome(scope, outcome)
     Some(ProofPending) ->
@@ -2192,13 +2535,18 @@ fn seal_outcome(outcome: Outcome(a, e), proof: Proof) -> Outcome(a, e) {
 
 /// Queue a sealed outcome for delivery and apply the failure policy to it.
 fn queue_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
+  let scope = Scope(..scope, sealed: set.insert(scope.sealed, outcome.index))
+
   // A consumer that has halted or died is not owed an account, and queueing for
-  // it would grow a backlog nobody will ever drain.
+  // it would grow a backlog nobody will ever drain. A witnessed run's
+  // consumer never wanted one: the outcome is dropped here and its slot
+  // returned now, since no delivery will ever return it.
   let scope = case scope.consumer {
     Waiting -> Scope(..scope, ready: push_backlog(scope.ready, outcome))
     Busy -> Scope(..scope, ready: push_backlog(scope.ready, outcome))
     Halted -> scope
     Gone -> scope
+    Discarding -> Scope(..scope, slots: scope.slots + 1)
   }
 
   // A lost proof ends the run the way a crash does: the caller asked for
@@ -2222,11 +2570,11 @@ fn queue_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
   }
 }
 
-/// The proof standing for a task's owner, or `None` for a plain task.
+/// The proof standing for a task's owners, or `None` for a task with none.
 fn proof_for(owners: List(OwnerSlot), index: Int) -> Option(Proof) {
-  case list.find(owners, fn(slot) { slot.index == index }) {
-    Ok(slot) -> Some(slot.proof)
-    Error(Nil) -> None
+  case list.any(owners, fn(slot) { slot.index == index }) {
+    True -> Some(aggregate_proof(owners, index))
+    False -> None
   }
 }
 
@@ -2235,10 +2583,11 @@ fn find_owner(owners: List(OwnerSlot), pid: Pid) -> Result(OwnerSlot, Nil) {
   list.find(owners, fn(slot) { slot.pid == pid })
 }
 
-/// Replace a slot in the ledger, matching on its task index.
+/// Replace a slot in the ledger, matching on its monitor: a task may have
+/// several owners, so the index alone no longer names one.
 fn put_owner(owners: List(OwnerSlot), slot: OwnerSlot) -> List(OwnerSlot) {
   list.map(owners, fn(existing) {
-    case existing.index == slot.index {
+    case existing.monitor == slot.monitor {
       True -> slot
       False -> existing
     }
@@ -2335,6 +2684,7 @@ fn finish(scope: Scope(a, e)) -> Nil {
 
   case scope.consumer {
     Gone -> Nil
+    Discarding -> Nil
     Waiting -> process.send(scope.outbox, Done)
     Busy -> process.send(scope.outbox, Done)
     Halted -> process.send(scope.outbox, Done)

@@ -523,3 +523,211 @@ pub fn a_scope_answers_the_system_plane_test() -> Nil {
     == PulledOutcome(Completed(index: 0, value: 1))
   assert weft.pull(detached, within: 5000) == AllDelivered
 }
+
+// --- Owners discovered while the task runs -----------------------------------
+
+pub fn a_managed_task_adopts_owners_as_it_runs_test() -> Nil {
+  let #(owner, commands) = obedient_owner()
+
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: drain_on_cancel(commands))
+          as "a live run adopts an owner published mid-flight"
+        Ok("answered")
+      }),
+    ])
+    |> weft.start_detached
+  let scope_exit = watch_exit(weft.scope_pid(detached))
+
+  // The worker has returned, but the owner it published is still alive, so
+  // the outcome is withheld exactly as it would be for a prepared owner.
+  assert weft.pull(detached, within: 200) == NotYet
+
+  process.send(commands, DrainCleanly)
+  assert weft.pull(detached, within: 5000)
+    == PulledOutcome(Completed(index: 0, value: "answered"))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+  assert await_exit(scope_exit) == process.Normal
+}
+
+pub fn a_task_with_two_owners_is_drained_only_when_both_are_test() -> Nil {
+  let #(first, first_commands) = obedient_owner()
+  let #(second, second_commands) = obedient_owner()
+
+  // The worker adopts asynchronously; the test must not drain an owner
+  // the scope has not yet monitored, or the drain reads as an owner that
+  // was dead on adoption.
+  let adopted = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner: first, cancel: deaf_cancel())
+          as "the first owner is adopted"
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner: second, cancel: deaf_cancel())
+          as "the second owner is adopted"
+        process.send(adopted, Nil)
+        Ok(2)
+      }),
+    ])
+    |> weft.start_detached
+  let assert Ok(Nil) = process.receive(adopted, 2000)
+    as "both owners are adopted before the test drains either"
+
+  process.send(first_commands, DrainCleanly)
+  assert weft.pull(detached, within: 200) == NotYet
+
+  process.send(second_commands, DrainCleanly)
+  assert weft.pull(detached, within: 5000)
+    == PulledOutcome(Completed(index: 0, value: 2))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
+
+pub fn one_lost_owner_seals_the_task_exactly_once_test() -> Nil {
+  let #(first, _first_commands) = obedient_owner()
+  let #(second, second_commands) = obedient_owner()
+
+  let adopted = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner: first, cancel: deaf_cancel())
+          as "the first owner is adopted"
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner: second, cancel: deaf_cancel())
+          as "the second owner is adopted"
+        process.send(adopted, Nil)
+        Ok(3)
+      }),
+    ])
+    |> weft.start_detached
+  let scope_exit = watch_exit(weft.scope_pid(detached))
+  let assert Ok(Nil) = process.receive(adopted, 2000)
+    as "both owners are adopted before the test kills one"
+
+  // Losing one owner loses the task at once; the other owner's later clean
+  // exit must not write a second entry for the same task.
+  process.kill(first)
+  let assert PulledOutcome(DrainProofLost(index: 0, ..)) =
+    weft.pull(detached, within: 5000)
+    as "a lost owner settles the task as a lost proof"
+
+  process.send(second_commands, DrainCleanly)
+  assert weft.pull(detached, within: 5000) == AllDelivered
+  assert abnormal_named(await_exit(scope_exit), "weft_drain_proof_lost")
+}
+
+pub fn adoption_after_cancellation_is_refused_but_still_drained_test() -> Nil {
+  let #(first, first_commands) = obedient_owner()
+  let #(second, second_commands) = obedient_owner()
+
+  // The ledger travels: the worker hands it to this process and parks, so
+  // an adoption can arrive from outside the worker after cancellation has
+  // already killed the worker itself.
+  let handoff = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        process.send(handoff, ledger)
+        process.sleep_forever()
+        Ok(Nil)
+      }),
+    ])
+    |> weft.start_detached
+  let assert Ok(ledger) = process.receive(handoff, 2000)
+    as "the worker hands its ledger over"
+
+  assert weft.adopt(
+      ledger,
+      owner: first,
+      cancel: drain_on_cancel(first_commands),
+    )
+    == weft.Adopted
+
+  // Cancellation and the late publication go to the same inbox from the
+  // same process, so the scope sees them in this order. The watch on the
+  // late owner is taken first, so its true exit reason is read rather
+  // than the `noproc` a late monitor finds.
+  let second_exit = watch_exit(second)
+  weft.cancel_detached(detached)
+  assert weft.adopt(
+      ledger,
+      owner: second,
+      cancel: drain_on_cancel(second_commands),
+    )
+    == weft.Refused
+
+  // Refused is not abandoned: the scope asked the late owner to stop and
+  // will wait for it exactly as for the adopted one.
+  assert await_exit(second_exit) == process.Normal
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
+
+// --- Witnessed runs and consumer death -----------------------------------------
+
+pub fn a_witnessed_run_reports_only_through_its_exit_test() -> Nil {
+  let #(owner, commands) = obedient_owner()
+
+  let scope =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: drain_on_cancel(commands))
+          as "the witnessed task adopts its owner"
+        Ok(Nil)
+      }),
+    ])
+    |> weft.start_witnessed
+  let scope_exit = watch_exit(scope)
+
+  // Nobody pulls, and nothing is owed: the scope stays alive for exactly as
+  // long as the owner does, then exits with the verdict.
+  process.sleep(100)
+  assert process.is_alive(scope)
+
+  process.send(commands, DrainCleanly)
+  assert await_exit(scope_exit) == process.Normal
+}
+
+pub fn a_witnessed_run_carries_a_lost_proof_in_its_exit_test() -> Nil {
+  let #(owner, _commands) = obedient_owner()
+
+  let scope =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: deaf_cancel())
+          as "the witnessed task adopts its owner"
+        Ok(Nil)
+      }),
+    ])
+    |> weft.start_witnessed
+  let scope_exit = watch_exit(scope)
+
+  process.kill(owner)
+  assert abnormal_named(await_exit(scope_exit), "weft_drain_proof_lost")
+}
+
+pub fn a_watched_consumers_death_cancels_the_run_test() -> Nil {
+  let consumer = process.spawn_unlinked(fn() { process.sleep_forever() })
+
+  let detached =
+    weft.new([
+      fn() {
+        process.sleep_forever()
+        Ok(Nil)
+      },
+    ])
+    |> weft.cancel_when_exits(consumer)
+    |> weft.start_detached
+
+  assert weft.pull(detached, within: 200) == NotYet
+  process.kill(consumer)
+  assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
+  assert weft.pull(detached, within: 5000) == AllDelivered
+}
