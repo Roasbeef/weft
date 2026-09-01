@@ -1412,6 +1412,13 @@ type Proof {
   /// The owner is still alive; the task's outcome is withheld.
   ProofPending
 
+  /// The owner was already dead when the scope went to adopt it. Its
+  /// `noproc` `DOWN` is queued and will settle the task as lost whatever
+  /// role it was declared with: a leaf that was gone before `begin` could
+  /// run proved nothing about work that never started, and its task must
+  /// still appear in the account.
+  ProofAbsent
+
   /// The owner's exit proved the subtree drained. The task's own outcome
   /// stands.
   ProofDrained
@@ -1636,16 +1643,6 @@ fn adopt_owners(
 
         OwnedTask(owner:, cancel:, role:, begin:) -> {
           let monitor = process.monitor(owner)
-          let slot =
-            OwnerSlot(
-              index:,
-              pid: owner,
-              monitor:,
-              role:,
-              cancel:,
-              proof: ProofPending,
-              canceller: None,
-            )
 
           // The `DOWN` for an already-dead owner is queued by the monitor
           // call, but `fill_slots` runs before the scope's first receive, so
@@ -1653,11 +1650,24 @@ fn adopt_owners(
           // liveness check is what actually holds `begin` back; the queued
           // `DOWN` then resolves the proof — carrying the real reason —
           // through the ordinary dispatch. The monitor still covers an
-          // owner that dies between these two lines.
-          let pending = case process.is_alive(owner) {
-            True -> [#(index, begin), ..pending]
-            False -> pending
+          // owner that dies between these two lines. Absence is recorded on
+          // the slot as well, because a task whose worker never spawns has
+          // no exit of its own to settle it: the `DOWN` must settle it as
+          // lost even for a leaf, or the account would come up one short.
+          let #(proof, pending) = case process.is_alive(owner) {
+            True -> #(ProofPending, [#(index, begin), ..pending])
+            False -> #(ProofAbsent, pending)
           }
+          let slot =
+            OwnerSlot(
+              index:,
+              pid: owner,
+              monitor:,
+              role:,
+              cancel:,
+              proof:,
+              canceller: None,
+            )
           #([slot, ..owners], pending)
         }
       }
@@ -1741,6 +1751,7 @@ fn settled(scope: Scope(a, e)) -> Bool {
 fn owner_resolved(slot: OwnerSlot) -> Bool {
   case slot.proof {
     ProofPending -> False
+    ProofAbsent -> False
     ProofDrained -> True
     ProofLost(..) -> True
     ProofUnconfirmed -> True
@@ -1871,11 +1882,14 @@ fn resolve_owner(
     Error(Nil) -> scope
 
     Ok(slot) -> {
-      let proof = judge_exit(slot.role, reason)
-      let slot = OwnerSlot(..slot, proof:, canceller: None)
-
       // The canceller's job ended with the owner, however the owner went.
+      // Dismissed off the slot as found, before the slot is rewritten
+      // without it — a helper whose `cancel` blocks would otherwise hold
+      // the scope open after the very exit it was asking for.
       dismiss_canceller(slot.canceller)
+
+      let proof = judge_exit(slot, reason)
+      let slot = OwnerSlot(..slot, proof:, canceller: None)
 
       let scope =
         Scope(
@@ -1888,14 +1902,33 @@ fn resolve_owner(
   }
 }
 
-/// What one exit reason proves, given what the owner was declared to be.
+/// What one exit reason proves, given what the owner was declared to be
+/// and whether it was ever alive under watch.
 ///
 /// The full matrix is spelled out because the corner that matters hides in
 /// it: a `noproc` `DOWN` — the owner was dead before the scope could watch
-/// it — arrives as an abnormal reason, and for a transitive owner that is a
-/// lost proof, not a fast drain. Proof that was never on file was never
-/// proof.
-fn judge_exit(role: OwnerRole, reason: ExitReason) -> Proof {
+/// it — arrives as an abnormal reason, and that is a lost proof whatever
+/// the role, because a leaf exemption covers an ordinary crash of work
+/// that ran, not an owner that was a corpse before `begin` was admitted.
+/// Proof that was never on file was never proof. For an owner that was
+/// alive at adoption, the role decides: any exit completes a leaf, and
+/// only a normal exit proves a transitive subtree drained.
+fn judge_exit(slot: OwnerSlot, reason: ExitReason) -> Proof {
+  case slot.proof {
+    ProofAbsent -> ProofLost(reason:)
+    ProofPending -> judge_role(slot.role, reason)
+
+    // A monitor fires once, so a resolved slot never sees a second exit;
+    // the role still answers, for totality.
+    ProofDrained -> judge_role(slot.role, reason)
+    ProofLost(..) -> judge_role(slot.role, reason)
+    ProofUnconfirmed -> judge_role(slot.role, reason)
+  }
+}
+
+/// The role's half of the judgement, for an owner that was alive under
+/// watch.
+fn judge_role(role: OwnerRole, reason: ExitReason) -> Proof {
   case role, reason {
     Leaf, process.Normal -> ProofDrained
     Leaf, process.Killed -> ProofDrained
@@ -1912,6 +1945,7 @@ fn worsen_for(verdict: Verdict, proof: Proof) -> Verdict {
     ProofLost(..) -> SomeLost
     ProofUnconfirmed -> worsen_to_unconfirmed(verdict)
     ProofPending -> verdict
+    ProofAbsent -> verdict
     ProofDrained -> verdict
   }
 }
@@ -1959,6 +1993,7 @@ fn reach_forward(scope: Scope(a, e), slot: OwnerSlot) -> Scope(a, e) {
       }
 
     ProofPending -> scope
+    ProofAbsent -> scope
     ProofDrained -> scope
     ProofUnconfirmed -> scope
   }
@@ -2020,6 +2055,10 @@ fn expire_grace(scope: Scope(a, e)) -> Scope(a, e) {
         apply_proof(scope, slot)
       }
 
+      // An absent owner's `noproc` `DOWN` was queued at adoption, ahead of
+      // any grace, so the ordinary dispatch has already settled it by the
+      // time this event can fire; the arm is totality.
+      ProofAbsent -> scope
       ProofDrained -> scope
       ProofLost(..) -> scope
       ProofUnconfirmed -> scope
@@ -2128,6 +2167,8 @@ fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
     None -> queue_outcome(scope, outcome)
     Some(ProofPending) ->
       Scope(..scope, awaiting: [#(outcome.index, outcome), ..scope.awaiting])
+    Some(ProofAbsent) ->
+      Scope(..scope, awaiting: [#(outcome.index, outcome), ..scope.awaiting])
     Some(ProofDrained) -> queue_outcome(scope, outcome)
     Some(ProofLost(reason:)) ->
       queue_outcome(scope, DrainProofLost(index: outcome.index, reason:))
@@ -2142,6 +2183,7 @@ fn note_outcome(scope: Scope(a, e), outcome: Outcome(a, e)) -> Scope(a, e) {
 fn seal_outcome(outcome: Outcome(a, e), proof: Proof) -> Outcome(a, e) {
   case proof {
     ProofPending -> outcome
+    ProofAbsent -> outcome
     ProofDrained -> outcome
     ProofLost(reason:) -> DrainProofLost(index: outcome.index, reason:)
     ProofUnconfirmed -> CancellationUnconfirmed(index: outcome.index)
@@ -2260,6 +2302,7 @@ fn dispatch_cancels(scope: Scope(a, e)) -> Scope(a, e) {
       }
 
       ProofPending, Some(..) -> scope
+      ProofAbsent, _canceller -> scope
       ProofDrained, _canceller -> scope
       ProofLost(..), _canceller -> scope
       ProofUnconfirmed, _canceller -> scope

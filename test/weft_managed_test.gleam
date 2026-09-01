@@ -176,6 +176,31 @@ pub fn an_owner_dead_before_the_run_never_lets_begin_run_test() -> Nil {
   assert process.receive(ran, 200) == Error(Nil)
 }
 
+pub fn a_leaf_owner_dead_before_the_run_is_still_accounted_for_test() -> Nil {
+  let #(owner, commands) = obedient_owner()
+  process.send(commands, DrainCleanly)
+
+  // The leaf exemption covers an ordinary crash of work that ran. An owner
+  // that was a corpse before the run existed proved nothing, and its task
+  // — whose worker is never admitted — must still appear in the account
+  // rather than vanish from it.
+  let ran = process.new_subject()
+  let outcomes =
+    weft.new_prepared([
+      weft.prepared_leaf(owner:, cancel: deaf_cancel(), begin: fn() {
+        process.send(ran, True)
+        Ok(1)
+      }),
+      weft.task(fn() { Ok(2) }),
+    ])
+    |> weft.start
+
+  let assert [DrainProofLost(index: 0, ..), Completed(index: 1, value: 2)] =
+    outcomes
+    as "a dead-on-arrival leaf is a lost proof, and the account stays total"
+  assert process.receive(ran, 200) == Error(Nil)
+}
+
 pub fn a_leaf_owners_crash_is_not_a_lost_proof_test() -> Nil {
   let #(owner, _commands) = obedient_owner()
 
@@ -254,6 +279,36 @@ pub fn cancellation_reaches_the_owner_and_waits_for_its_exit_test() -> Nil {
   assert weft.pull(detached, within: 5000) == AllDelivered
 
   assert await_exit(scope_exit) == process.Normal
+}
+
+pub fn an_owners_exit_dismisses_a_cancel_helper_that_is_still_running_test() -> Nil {
+  let #(owner, commands) = obedient_owner()
+
+  // The cancel closure asks the owner to drain and then never returns. The
+  // owner's exit is the fact the run was waiting on; the helper that asked
+  // for it must not hold the scope open once that fact is in.
+  let stuck_cancel = fn() {
+    process.send(commands, DrainCleanly)
+    process.sleep_forever()
+  }
+
+  let finished = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let outcomes =
+      weft.new_prepared([
+        weft.prepared_task(owner:, cancel: stuck_cancel, begin: fn() {
+          process.sleep_forever()
+          Ok(Nil)
+        }),
+      ])
+      |> weft.deadline(50)
+      |> weft.start
+    process.send(finished, outcomes)
+  })
+
+  let assert Ok([Abandoned(index: 0)]) = process.receive(finished, 3000)
+    as "the run ends once the owner drains, however long its canceller lingers"
+  Nil
 }
 
 pub fn a_deaf_owner_settles_as_unconfirmed_once_the_grace_expires_test() -> Nil {

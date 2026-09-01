@@ -43,9 +43,14 @@ the engine's module doc:
   that was dead on arrival, and the `DOWN` still carries the real reason.
 - Owners are asked, never killed; each `cancel` runs on a disposable
   linked helper, and a crashed helper costs a log line, never the witness.
+  The helper is dismissed the moment its owner exits, so a `cancel` that
+  blocks cannot hold the scope open past the fact it was asking for.
 - Only a normal transitive-owner exit proves drain; `prepared_leaf` is the
   declared exemption for owners with no descendants. `noproc` counts as
-  lost — proof that was never on file was never proof.
+  lost *whatever the role* — proof that was never on file was never proof,
+  and the leaf exemption covers a crash of work that ran, not an owner that
+  was a corpse before `begin` was admitted. The slot records that absence
+  (`ProofAbsent`) so the task still lands in the account.
 - A lost proof ends the run under `CancelSiblings`, exactly as a crash
   does; `CancellationUnconfirmed` never does, since it presupposes a
   cancellation already in flight.

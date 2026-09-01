@@ -75,7 +75,7 @@ makes sense whole.
 6. **A managed outcome is sealed by its proof at exactly one place**
    (`note_outcome`/`seal_outcome`): worker facts and owner facts meet
    there, and `settled` refuses to end the run while any owner is
-   `ProofPending` or any helper is alive. Delivering an outcome whose
+   `ProofPending` or `ProofAbsent` or any helper is alive. Delivering an outcome whose
    owner has not resolved re-opens the ownership hole weft#5 closed.
 7. **Depth-first injection everywhere**: what a handler injects runs
    before what was already queued; in the state machine the full order
