@@ -19,8 +19,8 @@ import gleam/int
 import gleam/list
 import gleeunit
 import weft.{
-  type Outcome, Abandoned, CancelSiblings, Completed, Continue, Crashed, Failed,
-  Halt, KeepGoing, NeverStarted,
+  type Outcome, Abandoned, CancelSiblings, CancellationUnconfirmed, Completed,
+  Continue, Crashed, DrainProofLost, Failed, Halt, KeepGoing, NeverStarted,
 }
 
 pub fn main() -> Nil {
@@ -284,6 +284,8 @@ pub fn fold_carries_an_accumulator_over_the_whole_account_test() {
         Crashed(..) -> Continue(total)
         Abandoned(..) -> Continue(total)
         NeverStarted(..) -> Continue(total)
+        DrainProofLost(..) -> Continue(total)
+        CancellationUnconfirmed(..) -> Continue(total)
       }
     })
 
