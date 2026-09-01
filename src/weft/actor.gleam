@@ -13,9 +13,11 @@
 //// `Next` are opaque, so there is no wrapping trick that adds a field to
 //// them: a `handle_continue` analog has to be able to put a message
 //// *somewhere the loop looks before the mailbox*, and only the loop can
-//// own that place. So weft reimplements the loop and keeps the surface
-//// identical, which is the trade that makes migration a change of import
-//// line.
+//// own that place. The same is true of the three smaller gaps that ride
+//// along — a `terminate/2` analog, hibernation, and a loop timeout — each
+//// of which is a decision made between `receive` and the callback. So weft
+//// reimplements the loop and keeps the surface identical, which is the
+//// trade that makes migration a change of import line.
 ////
 //// ## The continue queue, and what its order guarantees
 ////
@@ -94,6 +96,7 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import weft/internal/sys
+import weft/internal/timer
 
 // ---------------------------------------------------------------- interop
 
@@ -412,7 +415,23 @@ pub opaque type Builder(state, message, return) {
     on_message: fn(state, message) -> Next(state, message),
     /// The name to register the actor under, if any.
     name: Option(process.Name(message)),
+    /// Whether the actor traps exits, turning exit signals from linked
+    /// processes into messages the loop can act on.
+    trap_exits: Bool,
+    /// Called on the way out, if the actor gets a chance. See `on_shutdown`
+    /// for exactly when that is.
+    on_shutdown: Option(fn(state, ExitReason) -> Nil),
+    /// How long the actor may sit idle, in milliseconds, before hibernating.
+    hibernate_after: Option(Int),
+    /// The loop timeout: a message to handle after a quiet period.
+    idle_timeout: Option(Idle(message)),
   )
+}
+
+/// The loop timeout configuration: how long quiet counts as idle, and what
+/// the actor sends itself when it does.
+type Idle(message) {
+  Idle(after_ms: Int, message: message)
 }
 
 /// Describe an actor with no custom initialisation.
@@ -436,6 +455,10 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     initialisation_timeout: 1000,
     on_message: fn(state, _message) { continue(state) },
     name: None,
+    trap_exits: False,
+    on_shutdown: None,
+    hibernate_after: None,
+    idle_timeout: None,
   )
 }
 
@@ -471,6 +494,10 @@ pub fn new_with_initialiser(
     initialisation_timeout: timeout,
     on_message: fn(state, _message) { continue(state) },
     name: None,
+    trap_exits: False,
+    on_shutdown: None,
+    hibernate_after: None,
+    idle_timeout: None,
   )
 }
 
@@ -511,6 +538,152 @@ pub fn named(
   name: process.Name(message),
 ) -> Builder(state, message, return) {
   Builder(..builder, name: Some(name))
+}
+
+/// Choose whether the actor traps exits.
+///
+/// A trapping actor receives an exit signal from a linked process as a
+/// message instead of dying of it, which is what makes an orderly shutdown
+/// possible; it is the prerequisite for `on_shutdown` firing on anything
+/// other than the actor's own `stop`.
+///
+/// The policy the loop applies to a trapped exit mirrors what would have
+/// happened without trapping, plus the chance to run `on_shutdown` first:
+/// an exit from the parent shuts the actor down whatever the reason —
+/// including `Normal`, as OTP behaviours do, because a child outliving its
+/// parent is a leak — and an exit from any other linked process shuts it
+/// down only if the reason is abnormal.
+///
+/// Trapping is off by default, and turning it on changes what kills the
+/// actor: `process.kill` still does, `process.send_exit` no longer does.
+///
+/// ## Examples
+///
+/// ```gleam
+/// actor.new(state)
+/// |> actor.trapping_exits(True)
+/// |> actor.on_shutdown(fn(state, _reason) { close(state.handle) })
+/// ```
+pub fn trapping_exits(
+  builder: Builder(state, message, return),
+  trap: Bool,
+) -> Builder(state, message, return) {
+  Builder(..builder, trap_exits: trap)
+}
+
+/// Run `handler` with the final state as the actor shuts down.
+///
+/// This is a `terminate/2` analog and it is **best effort**. Read the list
+/// before relying on it:
+///
+/// - It runs when a handler returns `stop` or `stop_abnormal`, with that
+///   reason.
+/// - It runs when a trapped exit signal shuts the actor down, with the
+///   reason from the signal — but only if `trapping_exits(True)` was set.
+///   Without trapping, an exit signal kills the process directly and no
+///   Gleam code runs.
+/// - It never runs when the actor is killed with an untrappable signal
+///   (`process.kill`, or a supervisor's brutal kill after a shutdown
+///   timeout). Nothing runs then; that is what untrappable means.
+/// - It never runs if initialisation fails, because there is no state to
+///   hand it.
+/// - It does not run if the actor's own handler crashes.
+///
+/// So it is the right place to release something whose loss is an
+/// inconvenience, and the wrong place for anything whose loss is a
+/// correctness problem. If it must happen, it belongs with a process that
+/// monitors this one, not here.
+///
+/// The reason passed may itself be `Killed` — that is a *linked* process
+/// having been killed, which this actor was told about and is shutting down
+/// because of, not this actor being killed.
+///
+/// ## Examples
+///
+/// ```gleam
+/// actor.new(state)
+/// |> actor.trapping_exits(True)
+/// |> actor.on_shutdown(fn(state, reason) {
+///   log("closing " <> state.name <> ": " <> string.inspect(reason))
+/// })
+/// ```
+pub fn on_shutdown(
+  builder: Builder(state, message, return),
+  handler: fn(state, ExitReason) -> Nil,
+) -> Builder(state, message, return) {
+  Builder(..builder, on_shutdown: Some(handler))
+}
+
+/// Hibernate the actor after `ms` milliseconds with no messages.
+///
+/// Hibernation runs a full garbage collection and drops the process stack,
+/// leaving the actor at its minimum footprint until the next message wakes
+/// it. It is for the ten-thousand-mostly-idle-actors case, where the
+/// aggregate heap matters more than the microseconds a wake-up costs; an
+/// actor that receives steadily should not be given it.
+///
+/// The mechanism is a receive timeout rather than a timer message, so
+/// nothing is ever queued and there is no stale fire to discard: the actor
+/// hibernates from inside the receive it was already blocked in, and
+/// `erlang:hibernate/3` resumes it into the same loop with the same state
+/// when a message arrives.
+///
+/// ## Examples
+///
+/// ```gleam
+/// actor.new(state)
+/// |> actor.hibernate_after(60_000)
+/// |> actor.on_message(handle)
+/// ```
+pub fn hibernate_after(
+  builder: Builder(state, message, return),
+  ms: Int,
+) -> Builder(state, message, return) {
+  Builder(..builder, hibernate_after: Some(ms))
+}
+
+/// Handle `message` after `ms` milliseconds with no messages.
+///
+/// This is gen_server's loop timeout: the clock is reset every time the
+/// actor handles a message, so it fires only after a genuinely quiet
+/// stretch, and the message is an ordinary one delivered to the ordinary
+/// handler.
+///
+/// The mechanism is a named timer from `weft/internal/timer` rather than a
+/// receive timeout, because an actor may also be hibernating, and a receive
+/// cannot have two deadlines. That choice brings a race with it, and the
+/// race is closed rather than tolerated: the timer can fire in the instant
+/// between a real message arriving and the actor resetting the clock, which
+/// would put a timeout message in the mailbox that no longer describes
+/// anything true. Every arming carries a generation stamp, and the timer
+/// book drops a fire whose stamp is no longer current, so a message already
+/// in flight when the clock is reset is discarded before it reaches the
+/// handler. The visible behaviour is the one the name promises: traffic
+/// cancels the timeout.
+///
+/// The timeout is not armed while the actor is suspended by `sys:suspend/1`
+/// — a suspended actor is not idle, it is frozen — and is re-armed on
+/// resume.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // A connection that closes itself after five minutes of quiet.
+/// actor.new(connection)
+/// |> actor.idle_timeout(300_000, IdleTooLong)
+/// |> actor.on_message(fn(state, message) {
+///   case message {
+///     IdleTooLong -> actor.stop()
+///     Request(r) -> actor.continue(serve(state, r))
+///   }
+/// })
+/// ```
+pub fn idle_timeout(
+  builder: Builder(state, message, return),
+  ms: Int,
+  message: message,
+) -> Builder(state, message, return) {
+  Builder(..builder, idle_timeout: Some(Idle(after_ms: ms, message:)))
 }
 
 // ------------------------------------------------------------------ start
@@ -646,7 +819,26 @@ type Self(state, message) {
     queue: List(message),
     /// The programmer's message handler.
     handler: fn(state, message) -> Next(state, message),
+    /// The best-effort shutdown callback, if configured.
+    on_shutdown: Option(fn(state, ExitReason) -> Nil),
+    /// Whether exit signals arrive as messages. Decides whether the loop
+    /// installs the trapped-exit arm at all.
+    trapping: Bool,
+    /// The quiet period after which the actor hibernates, if configured.
+    hibernate_after: Option(Int),
+    /// The loop timeout, if configured.
+    idle: Option(Idle(message)),
+    /// The timer book backing the loop timeout, and the flush that makes a
+    /// cancelled timeout safe.
+    timers: timer.Timers(TimerKey, message),
   )
+}
+
+/// The keys the actor arms timers under. There is one; the type exists so
+/// that the timer book's key type is a name rather than a bare atom, and so
+/// that a second timeout later cannot be confused with this one.
+type TimerKey {
+  IdleTimer
 }
 
 /// Everything the loop can receive, in one type, so that a single selector
@@ -658,6 +850,13 @@ type Event(message) {
   /// Something on the `system` tag: a debug request, or a request weft does
   /// not implement.
   System(incoming: sys.Incoming)
+
+  /// An exit signal from a linked process, arriving as a message because
+  /// the actor traps exits.
+  Trapped(exit: process.ExitMessage)
+
+  /// The loop timeout fired. It may be stale; the timer book decides.
+  Tick(fired: timer.Fired(TimerKey, message))
 
   /// A message no selector arm claimed. Discarded with a warning.
   Unexpected(message: Dynamic)
@@ -678,6 +877,13 @@ fn initialise_actor(
   parent: Pid,
   ack: Subject(Result(return, String)),
 ) -> ExitReason {
+  // Trapping is established before the initialiser runs, so that a link
+  // made during initialisation is already covered by it.
+  case builder.trap_exits {
+    True -> process.trap_exits(True)
+    False -> Nil
+  }
+
   let started = {
     use subject <- result.try(case builder.name {
       None -> Ok(process.new_subject())
@@ -712,12 +918,17 @@ fn initialise_actor(
           selector: process.map_selector(selector, Received),
           queue: injected,
           handler: builder.on_message,
+          on_shutdown: builder.on_shutdown,
+          trapping: builder.trap_exits,
+          hibernate_after: builder.hibernate_after,
+          idle: builder.idle_timeout,
+          timers: timer.new(process.new_subject()),
         )
 
       // The queue is already loaded, so releasing the parent here cannot
       // let an external message overtake a continue.
       process.send(ack, Ok(return))
-      loop(self)
+      loop(arm_idle(self))
     }
   }
 }
@@ -731,20 +942,43 @@ fn register_self(name: process.Name(message)) -> Result(Nil, String) {
   }
 }
 
+/// What a suspended actor is still willing to receive.
+///
+/// Two things, and no more. The debug plane, because `resume` arrives on it
+/// and a suspension nothing can lift is a hang. And, for an actor that traps
+/// exits, an exit signal — because a supervisor shutting down a suspended
+/// child would otherwise wait out its whole shutdown timeout and then kill
+/// it, which is the outcome trapping exists to avoid. OTP's own
+/// `sys:suspend_loop` makes the same exception for the same reason.
+type Frozen {
+  FrozenSystem(incoming: sys.Incoming)
+  FrozenExit(exit: process.ExitMessage)
+}
+
 /// The receive loop.
 ///
 /// Suspension is checked first because it overrides everything else: a
 /// suspended actor may not handle mailbox messages, may not drain its
 /// injected queue, and may not time out. `sys:suspend/1` promises its caller
 /// a frozen process, and the only way to keep that promise is to serve
-/// nothing but the debug plane until `resume` arrives.
+/// nothing but the debug plane — and its own death — until `resume` arrives.
 fn loop(self: Self(state, message)) -> ExitReason {
   case sys.is_suspended(self.plane) {
-    True -> {
-      let incoming = process.selector_receive_forever(system_selector())
-      loop(handle_system(self, incoming))
-    }
+    True ->
+      case process.selector_receive_forever(frozen_selector(self.trapping)) {
+        FrozenSystem(incoming:) -> loop(handle_system(self, incoming))
+        FrozenExit(exit:) -> handle_exit(self, exit)
+      }
     False -> run(self)
+  }
+}
+
+/// The selector for a suspended actor.
+fn frozen_selector(trapping: Bool) -> Selector(Frozen) {
+  let selector = process.new_selector() |> sys.selecting(FrozenSystem)
+  case trapping {
+    False -> selector
+    True -> process.select_trapped_exits(selector, FrozenExit)
   }
 }
 
@@ -767,9 +1001,24 @@ fn run(self: Self(state, message)) -> ExitReason {
   }
 }
 
-/// Block for the next message.
+/// Block for the next message, hibernating first if the actor has been
+/// quiet for long enough.
 fn await_message(self: Self(state, message)) -> ExitReason {
-  dispatch(self, process.selector_receive_forever(running_selector(self)))
+  let selector = running_selector(self)
+  case self.hibernate_after {
+    None -> dispatch(self, process.selector_receive_forever(selector))
+
+    Some(ms) ->
+      case process.selector_receive(selector, ms) {
+        Ok(event) -> dispatch(self, event)
+
+        // Quiet for long enough: shed the stack and heap and resume into
+        // the same loop when a message arrives. This call does not return,
+        // which is safe here only because the loop's exit is a signal sent
+        // by `exit_process` rather than a value returned up this stack.
+        Error(Nil) -> sys.hibernate(fn() { loop(self) })
+      }
+  }
 }
 
 /// Take one already-arrived system message without blocking, if there is
@@ -796,21 +1045,41 @@ fn system_selector() -> Selector(sys.Incoming) {
 /// The selector for a running actor.
 ///
 /// The arms weft owns go on first so that a programmer's selector can
-/// deliberately replace them. The system arm goes on last, where nothing
-/// can shadow it: an
+/// deliberately replace them — most usefully the trapped-exit arm, for an
+/// actor that wants to see exits as its own messages rather than as
+/// shutdowns. The system arm goes on last, where nothing can shadow it: an
 /// actor invisible to `sys` is a debugging dead end, and that is not a
 /// choice worth offering.
 fn running_selector(self: Self(state, message)) -> Selector(Event(message)) {
   process.new_selector()
   |> process.select_other(Unexpected)
+  |> select_exits(self.trapping)
+  |> process.select_map(timer.subject(self.timers), Tick)
   |> process.merge_selector(self.selector)
   |> sys.selecting(System)
+}
+
+/// Add the trapped-exit arm, but only for an actor that traps: without
+/// trapping no such message can arrive, and installing the arm would
+/// suggest otherwise.
+fn select_exits(
+  selector: Selector(Event(message)),
+  trapping: Bool,
+) -> Selector(Event(message)) {
+  case trapping {
+    False -> selector
+    True -> process.select_trapped_exits(selector, Trapped)
+  }
 }
 
 /// Act on one received event.
 fn dispatch(self: Self(state, message), event: Event(message)) -> ExitReason {
   case event {
     System(incoming:) -> loop(handle_system(self, incoming))
+
+    Trapped(exit:) -> handle_exit(self, exit)
+
+    Tick(fired:) -> handle_tick(self, fired)
 
     // Not selected for by anyone, so the programmer has not accounted for
     // it. Discarding it silently would make a mis-wired selector look like
@@ -826,7 +1095,12 @@ fn dispatch(self: Self(state, message), event: Event(message)) -> ExitReason {
   }
 }
 
-/// Answer the debug plane.
+/// Answer the debug plane, and keep the idle timeout consistent with the
+/// mode.
+///
+/// A suspended actor is frozen, not idle, so its loop timeout is disarmed
+/// on the way in and re-armed on the way out. Leaving it armed would fire a
+/// timeout for a quiet period the actor was not allowed to act in.
 fn handle_system(
   self: Self(state, message),
   incoming: sys.Incoming,
@@ -841,16 +1115,64 @@ fn handle_system(
     }
 
     sys.Request(message:) -> {
+      let was_suspended = sys.is_suspended(self.plane)
       let plane = sys.handle(self.plane, message, holding: self.state)
-      Self(..self, plane:)
+      let self = Self(..self, plane:)
+      case was_suspended, sys.is_suspended(plane) {
+        False, True ->
+          Self(..self, timers: timer.cancel(self.timers, IdleTimer))
+        True, False -> arm_idle(self)
+        False, False -> self
+        True, True -> self
+      }
     }
+  }
+}
+
+/// Decide what a trapped exit signal means.
+///
+/// The parent's exit takes the actor with it whatever the reason, which is
+/// what every OTP behaviour does: a child that outlives the process that
+/// started it is a leak, and `Normal` is not an exception to that. Any other
+/// linked process is treated as the link itself would have treated it —
+/// ignored if it exited normally, fatal otherwise — so that turning trapping
+/// on to get `on_shutdown` does not quietly change the topology.
+fn handle_exit(
+  self: Self(state, message),
+  exit: process.ExitMessage,
+) -> ExitReason {
+  case exit.pid == sys.parent(self.plane) {
+    True -> shutdown(self, exit.reason)
+
+    False ->
+      case exit.reason {
+        Normal -> loop(self)
+        Killed -> shutdown(self, Killed)
+        Abnormal(reason:) -> shutdown(self, Abnormal(reason:))
+      }
+  }
+}
+
+/// Deliver a timer message, or drop it.
+///
+/// This is the consumer half of the timer book's cancel-with-flush: a fire
+/// whose arming has been cancelled or replaced dies here, and never reaches
+/// the programmer's handler.
+fn handle_tick(
+  self: Self(state, message),
+  fired: timer.Fired(TimerKey, message),
+) -> ExitReason {
+  case timer.accept(self.timers, fired) {
+    timer.Stale(timers:) -> loop(Self(..self, timers:))
+    timer.Deliver(timers:, key: IdleTimer, message:) ->
+      handle(Self(..self, timers:), message)
   }
 }
 
 /// Run the programmer's handler for one message.
 fn handle(self: Self(state, message), message: message) -> ExitReason {
   case self.handler(self.state, message) {
-    Stop(reason:) -> exit_process(reason)
+    Stop(reason:) -> shutdown(self, reason)
 
     Continue(state:, selector:, injected:) -> {
       let selector = case selector {
@@ -863,9 +1185,47 @@ fn handle(self: Self(state, message), message: message) -> ExitReason {
       // makes `then_handle` behave like gen_statem's `next_event` rather
       // than like a self-send.
       let queue = list.append(injected, self.queue)
-      loop(Self(..self, state:, selector:, queue:))
+      loop(arm_idle(Self(..self, state:, selector:, queue:)))
     }
   }
+}
+
+/// Re-arm the loop timeout, if there is one.
+///
+/// Called after every handled message, which is what "reset by traffic"
+/// means, and once at start. Re-arming cancels the previous timer; a fire
+/// that beat the cancel into the mailbox is stamped with the old generation
+/// and is discarded by `handle_tick`.
+fn arm_idle(self: Self(state, message)) -> Self(state, message) {
+  case self.idle {
+    None -> self
+    Some(Idle(after_ms:, message:)) ->
+      Self(
+        ..self,
+        timers: timer.set(
+          self.timers,
+          for: IdleTimer,
+          after: after_ms,
+          sending: message,
+        ),
+      )
+  }
+}
+
+/// Run the shutdown callback, then exit.
+///
+/// The callback runs before the exit signal so that it observes the state
+/// the actor actually stopped with, and so that anything it releases is
+/// released before linked processes are told. It is not protected: a
+/// callback that crashes takes the actor down with a different reason than
+/// the one it was shutting down with, which is why `on_shutdown` documents
+/// itself as best effort.
+fn shutdown(self: Self(state, message), reason: ExitReason) -> ExitReason {
+  case self.on_shutdown {
+    None -> Nil
+    Some(handler) -> handler(self.state, reason)
+  }
+  exit_process(reason)
 }
 
 /// Exit the process with a reason.

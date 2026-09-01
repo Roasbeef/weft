@@ -15,6 +15,7 @@ import gleam/list
 import gleam/otp/actor as otp_actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/system
+import gleam/result
 import gleam/string
 import gleeunit
 import weft/actor
@@ -39,6 +40,19 @@ fn discard(pid: Pid) -> Nil {
 /// the same way.
 @external(erlang, "sys", "get_status")
 fn get_status(pid: Pid) -> Dynamic
+
+/// `erlang:process_info/2`, so that a test can see the difference between an
+/// actor that is merely idle and one that has actually hibernated.
+@external(erlang, "erlang", "process_info")
+fn process_info(pid: Pid, item: atom.Atom) -> Dynamic
+
+/// Whether the process is parked in `erlang:hibernate/3` right now.
+fn is_hibernating(pid: Pid) -> Bool {
+  let info = process_info(pid, atom.create("current_function"))
+  decode.run(info, decode.at([1, 0], atom.decoder()))
+  |> result.map(atom.to_string)
+  == Ok("erlang")
+}
 
 /// Read an atom out of a nested position in a raw Erlang term.
 fn atom_at(data: Dynamic, path: List(Int)) -> String {
@@ -337,6 +351,202 @@ pub fn a_suspended_actor_still_answers_get_state_test() -> Nil {
 
   system.resume(started.pid)
   assert actor.call(started.data, waiting: 1000, sending: Count) == 2
+
+  discard(started.pid)
+}
+
+// -------------------------------------------------------- shutdown hooks
+
+pub fn on_shutdown_runs_with_the_final_state_on_stop_test() -> Nil {
+  let witness = process.new_subject()
+
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.on_shutdown(fn(state, reason) {
+      process.send(witness, #(state, reason))
+    })
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.send(started.data, Bump)
+  process.send(started.data, Bump)
+  process.send(started.data, Halt)
+
+  assert process.receive(witness, 1000) == Ok(#(2, process.Normal))
+}
+
+pub fn on_shutdown_runs_when_a_trapped_parent_exit_arrives_test() -> Nil {
+  let witness = process.new_subject()
+  let handoff = process.new_subject()
+
+  // The actor is started by a process of its own so that the test can kill
+  // its parent without killing itself.
+  let parent =
+    process.spawn_unlinked(fn() {
+      let assert Ok(started) =
+        actor.new(5)
+        |> actor.trapping_exits(True)
+        |> actor.on_shutdown(fn(state, reason) {
+          process.send(witness, #(state, reason))
+        })
+        |> actor.on_message(counter_handler)
+        |> actor.start
+        as "the actor must start"
+
+      process.send(handoff, started.pid)
+      process.sleep_forever()
+    })
+
+  let assert Ok(actor_pid) = process.receive(handoff, 1000)
+    as "the intermediate parent must hand the actor over"
+
+  process.kill(parent)
+
+  // The exit signal reaches the actor as a message because it traps, so it
+  // gets to run its shutdown callback before it goes.
+  assert process.receive(witness, 1000) == Ok(#(5, process.Killed))
+  process.sleep(50)
+  assert !process.is_alive(actor_pid)
+}
+
+pub fn a_suspended_actor_still_shuts_down_on_a_parent_exit_test() -> Nil {
+  // A supervisor terminating a suspended child must not have to wait out
+  // its shutdown timeout: the frozen loop still watches for exits.
+  let witness = process.new_subject()
+  let handoff = process.new_subject()
+
+  let parent =
+    process.spawn_unlinked(fn() {
+      let assert Ok(started) =
+        actor.new(3)
+        |> actor.trapping_exits(True)
+        |> actor.on_shutdown(fn(state, reason) {
+          process.send(witness, #(state, reason))
+        })
+        |> actor.on_message(counter_handler)
+        |> actor.start
+        as "the actor must start"
+
+      process.send(handoff, started.pid)
+      process.sleep_forever()
+    })
+
+  let assert Ok(actor_pid) = process.receive(handoff, 1000)
+    as "the intermediate parent must hand the actor over"
+
+  system.suspend(actor_pid)
+  process.kill(parent)
+
+  assert process.receive(witness, 1000) == Ok(#(3, process.Killed))
+  process.sleep(50)
+  assert !process.is_alive(actor_pid)
+}
+
+pub fn on_shutdown_does_not_run_when_the_actor_is_killed_test() -> Nil {
+  let witness = process.new_subject()
+
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.trapping_exits(True)
+    |> actor.on_shutdown(fn(state, reason) {
+      process.send(witness, #(state, reason))
+    })
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  // A kill signal is untrappable, so no Gleam code in the actor runs. This
+  // is the limitation `on_shutdown` documents, asserted rather than assumed.
+  discard(started.pid)
+
+  process.sleep(50)
+  assert !process.is_alive(started.pid)
+  assert process.receive(witness, 200) == Error(Nil)
+}
+
+// ---------------------------------------------------------- loop timeout
+
+pub fn idle_timeout_fires_after_a_quiet_stretch_test() -> Nil {
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.idle_timeout(40, Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.sleep(150)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 1
+
+  discard(started.pid)
+}
+
+pub fn idle_timeout_is_reset_by_traffic_test() -> Nil {
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.idle_timeout(80, Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  // Traffic every 20ms for 120ms: the actor is never quiet for the 80ms the
+  // timeout wants, so it must never fire — including in the instant a poke
+  // and a fire could cross, which is where the timer book's flush earns its
+  // keep.
+  list.each(list.repeat(Nil, 6), fn(_attempt) {
+    process.send(started.data, Poke)
+    process.sleep(20)
+  })
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 0
+
+  // Now let it go quiet.
+  process.sleep(200)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 1
+
+  discard(started.pid)
+}
+
+pub fn hibernation_does_not_stop_the_actor_answering_test() -> Nil {
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.hibernate_after(20)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  // Not hibernating yet, which is what keeps the assertion below honest.
+  assert !is_hibernating(started.pid)
+
+  // Long enough to be hibernating rather than merely idle, and asserted
+  // rather than assumed: a `hibernate_after` that quietly did nothing would
+  // pass every other line of this test.
+  process.sleep(120)
+  assert is_hibernating(started.pid)
+  process.send(started.data, Bump)
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 1
+
+  // And again, to prove the loop re-arms rather than hibernating once.
+  process.sleep(120)
+  process.send(started.data, Bump)
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 2
+  assert state_of(started.pid) == 2
+
+  discard(started.pid)
+}
+
+pub fn hibernation_and_the_idle_timeout_coexist_test() -> Nil {
+  // The two use different mechanisms — a receive timeout and a named timer
+  // — precisely so that both can be configured at once.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.hibernate_after(20)
+    |> actor.idle_timeout(40, Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.sleep(150)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 1
 
   discard(started.pid)
 }
