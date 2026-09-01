@@ -15,7 +15,12 @@ makes sense whole.
   and the scope's own exit reason carries the run's drain verdict (normal =
   every proof landed; `weft_drain_proof_lost` / `weft_drain_unconfirmed`
   otherwise). Detached runs (`start_detached`/`pull`/`cancel_detached`/
-  `start_relayed`) reuse the same pull protocol behind a handle. Depends on
+  `start_relayed`) reuse the same pull protocol behind a handle. A
+  `managed` task's `begin` receives a `Ledger`, and `adopt`/`adopt_leaf`
+  on it publish owners while the run is live (a task may hold many; its
+  proof is the aggregate); `start_witnessed` runs with no consumer at all,
+  the scope's exit being the whole report, and `cancel_when_exits` names a
+  consumer whose death cancels. Depends on
   `gleam_erlang/process` and `internal/sys` (the scope answers the system
   plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
   and slot scheduling would contort an actor loop.
@@ -43,7 +48,8 @@ makes sense whole.
 ## Message traffic, concretely
 
 - Engine: caller ⇄ scope via `Reply(a, e)` (`Ready`/`Delivered`/`Done`)
-  and `Request` (`Next`/`Stop`/`CancelRun`); workers → scope via
+  and `Request` (`Next`/`Stop`/`CancelRun`/`Publish`, the last answered
+  with an `Adoption` from inside the scope's step); workers → scope via
   `Report(worker, index, result)` then their linked `EXIT`; cancel signals
   and managed owners are watched by monitor (one generic monitor arm,
   discriminated by pid); each owner's `cancel` runs on a disposable linked
@@ -75,17 +81,24 @@ makes sense whole.
 6. **A managed outcome is sealed by its proof at exactly one place**
    (`note_outcome`/`seal_outcome`): worker facts and owner facts meet
    there, and `settled` refuses to end the run while any owner is
-   `ProofPending` or `ProofAbsent` or any helper is alive. Delivering an outcome whose
-   owner has not resolved re-opens the ownership hole weft#5 closed.
-7. **Depth-first injection everywhere**: what a handler injects runs
+   `ProofPending` or `ProofAbsent` or any helper is alive. Delivering an
+   outcome whose owner has not resolved re-opens the ownership hole weft#5
+   closed. With many owners per task the proof consulted is the aggregate
+   (`aggregate_proof`), and `Scope.sealed` guarantees a task is written to
+   the account at most once however many owners resolve after it.
+7. **A refused adoption still retains the owner** (`adopt_published`):
+   refusal withholds the permit to begin new work, never the witness, so
+   an owner published after cancellation is monitored, asked to stop, and
+   waited for like any other.
+8. **Depth-first injection everywhere**: what a handler injects runs
    before what was already queued; in the state machine the full order
    after a transition is enter-injected, then handler-injected, then
    replayed postponed events (arrival order), then the mailbox.
-8. **The engine's scope unlinks the caller itself in `finish`** — moving
+9. **The engine's scope unlinks the caller itself in `finish`** — moving
    that unlink, or doing it caller-side, reintroduces exit-message noise
    for trapping callers; the drain verdict travels by monitor (the
    `erlang:exit/1` after the unlink), never down the link.
-9. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
+10. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
    FFI stays inside it; the exceptions are the engine's
    `erlang:system_info(schedulers_online)` and `erlang:exit/1` externals,
    both stock BIFs argued in place.

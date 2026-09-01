@@ -13,6 +13,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
 | `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
+| `weft` dynamic adoption | loom#159 phase 2 | `0.3.0` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed`, `cancel_when_exits`; many owners per task |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -65,16 +66,34 @@ the engine's module doc:
   granting; `Ready` is the scope's first word so the handle has an inbox
   before the first delivery.
 
+Dynamic adoption (0.3.0) was the deferred item loom's custodian consumers
+came back for, and it settled these:
+
+- A task's proof is the *aggregate* over every owner it holds: lost as
+  soon as any one is lost, unconfirmed if any is unconfirmed, pending
+  while any is pending, drained only when all are. A task is sealed at
+  most once (`Scope.sealed`), so a second owner resolving after a lost
+  proof cannot write the account twice.
+- A refused adoption still retains and asks the owner. The permit is what
+  refusal withholds, never the witness.
+- Owners adopted mid-run are judged by role even when already dead at
+  adoption (`ProofPending`, not `ProofAbsent`): the caller asked us to
+  witness something it had already started, and whether its death lost a
+  subtree is exactly the role's question.
+- A witnessed run (`Discarding` consumer) returns a slot the moment an
+  outcome is sealed, since no delivery will ever return it, and sends no
+  `Done`.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both
   landed with #5 (`start_detached`/`pull`/`start_relayed`; the scope now
   answers get_state/get_status/suspend/resume and serves only the system
   plane while suspended).
-- **Dynamic mid-run adoption** (publishing an owner to a scope after the
-  run started) — #5 ships composition instead: a nested detached scope is
-  a publishable owner, and loom's custodian-shaped consumers should say
-  whether that is enough before a mutable ledger is added.
+- ~~Dynamic mid-run adoption~~ — landed in 0.3.0 (`managed`/`adopt`), once
+  loom's custodian consumers showed composition was not enough: a nested
+  scope treats its holder's normal exit as death and cancels, so a worker
+  that returns while its children drain cannot be expressed by nesting.
 - **A periodic timeout kind** for `weft/state_machine` (the heartbeat
   shape loom's broker helper needs: fire every N ms regardless of
   activity) — flagged by loom's adoption survey, waits for that consumer.
@@ -87,10 +106,12 @@ the engine's module doc:
 
 ## Publishing
 
-`0.1.0` is on hex.pm (published 2026-09-01). `0.2.0` carries managed
-tasks (#5) and is an additive minor: two new `Outcome` variants
+`0.1.0` and `0.2.0` are on hex.pm (published 2026-09-01). `0.2.0` carries
+managed tasks (#5) and is an additive minor: two new `Outcome` variants
 (`DrainProofLost`, `CancellationUnconfirmed`), so a consumer matching
-exhaustively on `Outcome` gains two arms and nothing else moves.
+exhaustively on `Outcome` gains two arms and nothing else moves. `0.3.0`
+adds dynamic adoption, witnessed runs and `cancel_when_exits`, all
+additive: no existing signature or variant changes.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`
