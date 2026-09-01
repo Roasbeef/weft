@@ -12,6 +12,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/actor` | [#4](https://github.com/Roasbeef/weft/issues/4) (closed) | `3cf3436`..`3b70c62` | Superset of upstream; continues, `on_shutdown`, hibernation, idle timeout |
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
+| `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (open) | `engine/managed-tasks` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -33,14 +34,45 @@ type on #2). Where this file and the code disagree, measure the code.
 - Suspension disarms timers, resume re-arms from full — a documented
   departure from gen_statem, whose timers run through a freeze.
 
+Managed tasks (#5) added their own rulings, recorded on the issue and in
+the engine's module doc:
+
+- Owners are adopted (monitored) before the first worker spawns, plus an
+  `is_alive` check at adoption — the queued `noproc` `DOWN` alone cannot
+  beat `fill_slots`, so the check is what holds `begin` back for an owner
+  that was dead on arrival, and the `DOWN` still carries the real reason.
+- Owners are asked, never killed; each `cancel` runs on a disposable
+  linked helper, and a crashed helper costs a log line, never the witness.
+- Only a normal transitive-owner exit proves drain; `prepared_leaf` is the
+  declared exemption for owners with no descendants. `noproc` counts as
+  lost — proof that was never on file was never proof.
+- A lost proof ends the run under `CancelSiblings`, exactly as a crash
+  does; `CancellationUnconfirmed` never does, since it presupposes a
+  cancellation already in flight.
+- One `cancel_grace` window per teardown, not per task; the grace bounds
+  the wait and pays for it by downgrading the scope's exit verdict.
+- The scope's exit reason IS the drain verdict (`weft_drain_proof_lost` /
+  `weft_drain_unconfirmed`), sent after the caller unlink so it travels by
+  monitor only. That is the composition story: a detached scope handed to
+  `prepared_task` as an owner propagates loss with no translation code.
+- Detached demand is unary and idempotent (`Next` while `Waiting` is a
+  no-op), which is what lets `pull` re-grant demand it cannot remember
+  granting; `Ready` is the scope's first word so the handle has an inbox
+  before the first delivery.
+
 ## Deferred, deliberately
 
-- **Detached start** for the engine (outcomes to a `Subject`, so an actor
-  can drive a run without blocking its mailbox) — ruled in on #1, not yet
-  built. First engine follow-up.
-- **The scope answering system messages** — `internal/sys` exists now;
-  wiring it into the engine's scope loop is small and makes runs visible
-  in the observer. Second engine follow-up.
+- **Detached start** and **the scope answering system messages** — both
+  landed with #5 (`start_detached`/`pull`/`start_relayed`; the scope now
+  answers get_state/get_status/suspend/resume and serves only the system
+  plane while suspended).
+- **Dynamic mid-run adoption** (publishing an owner to a scope after the
+  run started) — #5 ships composition instead: a nested detached scope is
+  a publishable owner, and loom's custodian-shaped consumers should say
+  whether that is enough before a mutable ledger is added.
+- **A periodic timeout kind** for `weft/state_machine` (the heartbeat
+  shape loom's broker helper needs: fire every N ms regardless of
+  activity) — flagged by loom's adoption survey, waits for that consumer.
 - **Cancelling a state or event timeout while staying put**
   (gen_statem's `infinity`) — shape sketched on #2, waits for a consumer.
 - **`on_handler_exit` / handler refs** for the event manager — waits for

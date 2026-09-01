@@ -40,6 +40,27 @@ order with pull-based delivery, so a slow consumer throttles the run instead
 of filling a mailbox. Sugar on top: `map`, `race`, `first_ok`. A run blocked
 inside `start` can be stopped from any other process with a cancel signal.
 
+For work that persists beyond its worker — an HTTP request whose socket
+lives under a client library's own supervisor — a *managed* task publishes
+an owner pid and a cancel capability alongside `begin`:
+
+```gleam
+let outcomes =
+  weft.new_prepared([weft.prepared_task(owner:, cancel:, begin:)])
+  |> weft.cancel_grace(2000)
+  |> weft.start
+```
+
+The scope monitors every owner before any worker spawns, holds the task's
+slot until both worker and owner have exited, and only a *normal* owner
+exit proves the subtree drained: an abnormal one is `DrainProofLost`, and a
+cancellation whose grace expires with the owner alive is
+`CancellationUnconfirmed`. The scope's own exit reason carries the run's
+drain verdict, so scopes compose: `start_detached` hands back a handle
+(`pull`, `cancel_detached`, `scope_pid` — or `start_relayed` for push
+delivery to an actor), and a nested detached scope is itself a publishable
+owner. Scopes answer OTP system messages like every other weft process.
+
 ## weft/actor — the superset actor
 
 A strict superset of `gleam/otp/actor`'s builder: the upstream surface works
