@@ -193,6 +193,12 @@ per change, and `0.4.0` is that settled surface: `adopt_under` /
 `adopt_leaf_under`, a pid that may be both watched and adopted, `unlinked`
 start on the actor and machine, `with_selector` on a machine step, and
 `weft/poll`. Every addition since 0.3.1 is additive.
+`0.4.1` is loom's phase-3 pair, developed against a **path dependency**
+on this checkout and cut once both had settled: the periodic timeout kind
+on the machine (`with_periodic_timeout`) and the actor (`actor.periodic`),
+and the injected clock for `weft/poll` (`Clock`, `monotonic`, `until_on`,
+`fold_until`, `Interval`). Both are additive — no existing signature,
+variant or behaviour moves, and `until` still means exactly what it meant.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`
