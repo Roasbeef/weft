@@ -15,6 +15,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft` managed tasks | [#5](https://github.com/Roasbeef/weft/issues/5) (closed) | `d348e22`..`25cf4a0` | Owner ledger, drain proof, grace, detached runs, scope on the sys plane; `0.2.0` |
 | `weft/poll` | loom#159 phase 2 | `0.4.0` | Bounded synchronous polling for foreground waits; owns no process |
 | `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.3.1` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.3.1), `cancel_when_exits`; many owners per task |
+| Periodic timeouts | loom#159 phase 3 | `0.4.1` | `sm.with_periodic_timeout` and `actor.periodic`; fixed delay, re-armed after the handler |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -85,6 +86,45 @@ came back for, and it settled these:
   outcome is sealed, since no delivery will ever return it, and sends no
   `Done`.
 
+## Rulings made for periodic timeouts (0.4.1)
+
+- **Fixed delay, not fixed rate.** The next fire is armed once the handler
+  for this one has returned, so the interval measures the gap between the
+  end of one tick and the start of the next. A handler slower than its own
+  interval slows the ticks down rather than accumulating a backlog of them
+  in the mailbox, which is what every consumer that asked for this wanted:
+  two heartbeats delivered back to back say nothing a single one did not.
+  A caller who needs fires on a grid wants a schedule, and a schedule is a
+  different primitive this deliberately is not.
+- **A periodic timeout is a named timeout that re-arms itself**, sharing
+  the name space with `with_named_timeout`. One name is one timer,
+  `cancel_timeout` ends either kind, and arming a name the other way round
+  converts it. The alternative — a fourth key space with a `cancel_periodic`
+  beside `cancel_timeout` — buys a machine the ability to hold a one-shot
+  and a periodic under the same name, which is a confusion rather than a
+  capability.
+- **The re-arm runs after the step's own timer actions and before the enter
+  callback.** That is what makes the handler's word final: a handler that
+  cancels the name ends the series even though its own fire is the one
+  being handled, and a handler that arms a new interval gets the new one.
+  It is also what makes a cancel from inside a tick safe — the fire already
+  in the mailbox carries a stale generation stamp and dies in the timer
+  book like any other.
+- **The actor's is a builder setting, not a step action.** `actor.periodic`
+  sits beside `idle_timeout` because the actor has no per-step timer
+  surface at all and growing one would be growing a state machine. A
+  consumer that needs to re-time or cancel a tick is a
+  `weft/state_machine`, where the interval belongs to the step. What an
+  actor handler can still do is `stop`.
+- **A beat resets the loop timeout**, because by the time the handler sees
+  it a beat is an ordinary message and `idle_timeout` documents itself as
+  reset by every message. gen_statem's event timeout has the same rule for
+  the same reason: any event, including a timeout firing, ends the quiet.
+  An actor wired with both wants that interaction on purpose.
+- **Suspension freezes a periodic timeout like every other**, re-arming
+  from full on resume rather than delivering the ticks the frozen process
+  could not have acted on.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both
@@ -95,9 +135,10 @@ came back for, and it settled these:
   loom's custodian consumers showed composition was not enough: a nested
   scope treats its holder's normal exit as death and cancels, so a worker
   that returns while its children drain cannot be expressed by nesting.
-- **A periodic timeout kind** for `weft/state_machine` (the heartbeat
-  shape loom's broker helper needs: fire every N ms regardless of
-  activity) — flagged by loom's adoption survey, waits for that consumer.
+- ~~A periodic timeout kind~~ — landed in `0.4.1` on both the machine and
+  the actor, once loom's adoption survey came back with three consumers
+  rather than one (the broker helper's heartbeat, the SQLite writer's
+  lease renewal, the strand driver's poll tick).
 - **Cancelling a state or event timeout while staying put**
   (gen_statem's `infinity`) — shape sketched on #2, waits for a consumer.
 - **`on_handler_exit` / handler refs** for the event manager — waits for

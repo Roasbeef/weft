@@ -81,19 +81,21 @@ actor.new_with_initialiser(1000, fn(subject) {
 |> actor.on_message(handle)
 |> actor.hibernate_after(30_000)
 |> actor.idle_timeout(3_600_000, ExpireSession)
+|> actor.periodic(every: 30_000, sending: RenewLease)
 |> actor.on_shutdown(fn(state, _reason) { store.close(state.store) })
 |> actor.trapping_exits(True)
 |> actor.start
 ```
 
 Also: `then_handle` (gen_statem's `next_event` for plain actors),
-hibernation, an idle timeout, and a best-effort shutdown callback.
+hibernation, an idle timeout, a fixed-delay heartbeat, and a best-effort
+shutdown callback.
 `supervised` hands back `gleam_otp`'s own `ChildSpecification`, so a weft
 actor drops into an upstream supervisor unchanged.
 
 ## weft/state_machine — a typed gen_statem
 
-State ADTs with compiler-checked exhaustiveness, `postpone`, three kinds of
+State ADTs with compiler-checked exhaustiveness, `postpone`, four kinds of
 timeout, and enter callbacks. The two features that delete the most
 hand-rolled code: postponing an event until the next state change, and a
 state timeout that dies with the state that armed it.
@@ -121,6 +123,13 @@ fn handle(state: State, data: Data, message: Message) -> sm.Next(State, Data, Me
   }
 }
 ```
+
+The fourth timeout kind is periodic: `with_periodic_timeout(name:, every:,
+sending:)` is a named timeout that arms itself again once the handler for
+each fire has returned, so a heartbeat keeps beating across every state the
+machine moves through and stops when `cancel_timeout` says so. The cadence
+is fixed delay rather than fixed rate, so a slow handler slows the ticks
+down instead of building a backlog of them in the mailbox.
 
 An enter callback returns `Enter`, not `Next`, so postponing where there is
 no event in hand is a compile error rather than a surprise at runtime.

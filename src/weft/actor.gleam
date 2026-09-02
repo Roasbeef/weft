@@ -13,9 +13,10 @@
 //// `Next` are opaque, so there is no wrapping trick that adds a field to
 //// them: a `handle_continue` analog has to be able to put a message
 //// *somewhere the loop looks before the mailbox*, and only the loop can
-//// own that place. The same is true of the three smaller gaps that ride
-//// along — a `terminate/2` analog, hibernation, and a loop timeout — each
-//// of which is a decision made between `receive` and the callback. So weft
+//// own that place. The same is true of the four smaller gaps that ride
+//// along — a `terminate/2` analog, hibernation, a loop timeout and a
+//// heartbeat — each of which is a decision made between `receive` and the
+//// callback. So weft
 //// reimplements the loop and keeps the surface identical, which is the
 //// trade that makes migration a change of import line.
 ////
@@ -427,6 +428,9 @@ pub opaque type Builder(state, message, return) {
     hibernate_after: Option(Int),
     /// The loop timeout: a message to handle after a quiet period.
     idle_timeout: Option(Idle(message)),
+    /// The heartbeat: a message to handle over and over, at an interval
+    /// nothing but the actor's own death interrupts.
+    periodic: Option(Periodic(message)),
   )
 }
 
@@ -434,6 +438,12 @@ pub opaque type Builder(state, message, return) {
 /// the actor sends itself when it does.
 type Idle(message) {
   Idle(after_ms: Int, message: message)
+}
+
+/// The heartbeat configuration: how long the gap between ticks is, and what
+/// the actor sends itself at each one.
+type Periodic(message) {
+  Periodic(every_ms: Int, message: message)
 }
 
 /// Describe an actor with no custom initialisation.
@@ -462,6 +472,7 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     on_shutdown: None,
     hibernate_after: None,
     idle_timeout: None,
+    periodic: None,
   )
 }
 
@@ -502,6 +513,7 @@ pub fn new_with_initialiser(
     on_shutdown: None,
     hibernate_after: None,
     idle_timeout: None,
+    periodic: None,
   )
 }
 
@@ -723,6 +735,59 @@ pub fn idle_timeout(
   Builder(..builder, idle_timeout: Some(Idle(after_ms: ms, message:)))
 }
 
+/// Handle `message` every `ms` milliseconds, whatever else the actor is
+/// doing.
+///
+/// This is the heartbeat, and it is the opposite of `idle_timeout`: traffic
+/// does not reset it and quiet does not cause it. The two compose — an actor
+/// may have both, and they are separate timers in the same book — because
+/// "tell me when nothing has happened for a while" and "remind me every
+/// thirty seconds" are different questions.
+///
+/// The interval is a *delay* rather than a rate: the next tick is armed once
+/// the handler for the last one has returned, so a handler slower than its
+/// own interval slows the ticks down instead of building a backlog of them
+/// in the mailbox. Two heartbeats delivered back to back say nothing a
+/// single one did not, and an actor that has fallen behind should not have
+/// to catch up on ticks before it can read a real message.
+///
+/// The heartbeat is a property of the actor rather than of a `Next`, so a
+/// handler cannot re-time or cancel it; an actor that wants a tick it can
+/// stop and restart is a `weft/state_machine` with a periodic timeout, where
+/// the interval belongs to the step. What a handler here can do is `stop`,
+/// which ends the ticks along with everything else.
+///
+/// Like the loop timeout, the heartbeat is disarmed while the actor is
+/// suspended by `sys:suspend/1` and re-armed from full on resume: a frozen
+/// actor is not beating, and the tick it could not act on is not owed to it
+/// afterwards.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // A lease that has to be renewed at a third of its own TTL, or the work
+/// // this actor guards belongs to somebody else.
+/// actor.new(lease)
+/// |> actor.periodic(every: 10_000, sending: Renew)
+/// |> actor.on_message(fn(state, message) {
+///   case message {
+///     Renew ->
+///       case renew(state) {
+///         Ok(state) -> actor.continue(state)
+///         Error(reason) -> actor.stop_abnormal("lease lost: " <> reason)
+///       }
+///     Work(job:) -> actor.continue(run(state, job))
+///   }
+/// })
+/// ```
+pub fn periodic(
+  builder: Builder(state, message, return),
+  every ms: Int,
+  sending message: message,
+) -> Builder(state, message, return) {
+  Builder(..builder, periodic: Some(Periodic(every_ms: ms, message:)))
+}
+
 // ------------------------------------------------------------------ start
 
 /// Start an actor from a builder.
@@ -871,17 +936,38 @@ type Self(state, message) {
     hibernate_after: Option(Int),
     /// The loop timeout, if configured.
     idle: Option(Idle(message)),
-    /// The timer book backing the loop timeout, and the flush that makes a
-    /// cancelled timeout safe.
+    /// The heartbeat, if configured.
+    beat: Option(Periodic(message)),
+    /// The timer book backing the loop timeout and the heartbeat, and the
+    /// flush that makes a cancelled timeout safe.
     timers: timer.Timers(TimerKey, message),
+    /// Whether the message being handled is a heartbeat tick, and so
+    /// whether the next beat is owed once that handler returns.
+    beating: Beating,
   )
 }
 
-/// The keys the actor arms timers under. There is one; the type exists so
-/// that the timer book's key type is a name rather than a bare atom, and so
-/// that a second timeout later cannot be confused with this one.
+/// Whether a beat is owed at the end of the handler now running.
+///
+/// The next tick is armed on the far side of the handler rather than before
+/// it, so the loop has to carry one bit of "why am I here" across the
+/// callback. It is a named pair rather than a flag because `Quiet` and
+/// `BeatPending` are the two things a reader of `rearm_beat` needs to tell
+/// apart, and neither is the negation of a polarity they have to remember.
+type Beating {
+  /// An ordinary message: nothing is owed.
+  Quiet
+
+  /// A heartbeat tick: arm the next one when this handler returns.
+  BeatPending
+}
+
+/// The keys the actor arms timers under. Two, and they are independent: the
+/// loop timeout measures quiet and is reset by every message, the heartbeat
+/// measures nothing and is reset by its own delivery.
 type TimerKey {
   IdleTimer
+  BeatTimer
 }
 
 /// Everything the loop can receive, in one type, so that a single selector
@@ -898,7 +984,8 @@ type Event(message) {
   /// the actor traps exits.
   Trapped(exit: process.ExitMessage)
 
-  /// The loop timeout fired. It may be stale; the timer book decides.
+  /// The loop timeout or the heartbeat fired. It may be stale; the timer
+  /// book decides.
   Tick(fired: timer.Fired(TimerKey, message))
 
   /// A message no selector arm claimed. Discarded with a warning.
@@ -965,13 +1052,15 @@ fn initialise_actor(
           trapping: builder.trap_exits,
           hibernate_after: builder.hibernate_after,
           idle: builder.idle_timeout,
+          beat: builder.periodic,
           timers: timer.new(process.new_subject()),
+          beating: Quiet,
         )
 
       // The queue is already loaded, so releasing the parent here cannot
       // let an external message overtake a continue.
       process.send(ack, Ok(return))
-      loop(arm_idle(self))
+      loop(arm_beat(arm_idle(self)))
     }
   }
 }
@@ -1138,12 +1227,14 @@ fn dispatch(self: Self(state, message), event: Event(message)) -> ExitReason {
   }
 }
 
-/// Answer the debug plane, and keep the idle timeout consistent with the
+/// Answer the debug plane, and keep the actor's timers consistent with the
 /// mode.
 ///
-/// A suspended actor is frozen, not idle, so its loop timeout is disarmed
-/// on the way in and re-armed on the way out. Leaving it armed would fire a
-/// timeout for a quiet period the actor was not allowed to act in.
+/// A suspended actor is frozen, not idle and not beating, so both timers are
+/// disarmed on the way in and re-armed from full on the way out. Leaving the
+/// loop timeout armed would fire a timeout for a quiet period the actor was
+/// not allowed to act in, and leaving the heartbeat armed would deliver a
+/// tick describing a stretch it could not have acted in either.
 fn handle_system(
   self: Self(state, message),
   incoming: sys.Incoming,
@@ -1162,9 +1253,8 @@ fn handle_system(
       let plane = sys.handle(self.plane, message, holding: self.state)
       let self = Self(..self, plane:)
       case was_suspended, sys.is_suspended(plane) {
-        False, True ->
-          Self(..self, timers: timer.cancel(self.timers, IdleTimer))
-        True, False -> arm_idle(self)
+        False, True -> Self(..self, timers: timer.cancel_all(self.timers))
+        True, False -> arm_beat(arm_idle(self))
         False, False -> self
         True, True -> self
       }
@@ -1207,8 +1297,15 @@ fn handle_tick(
 ) -> ExitReason {
   case timer.accept(self.timers, fired) {
     timer.Stale(timers:) -> loop(Self(..self, timers:))
+
     timer.Deliver(timers:, key: IdleTimer, message:) ->
       handle(Self(..self, timers:), message)
+
+    // The heartbeat is one-shot in the book like everything else; what makes
+    // it periodic is that its key is remembered here and armed again on the
+    // far side of the handler, which is what "fixed delay" means.
+    timer.Deliver(timers:, key: BeatTimer, message:) ->
+      handle(Self(..self, timers:, beating: BeatPending), message)
   }
 }
 
@@ -1228,7 +1325,7 @@ fn handle(self: Self(state, message), message: message) -> ExitReason {
       // makes `then_handle` behave like gen_statem's `next_event` rather
       // than like a self-send.
       let queue = list.append(injected, self.queue)
-      loop(arm_idle(Self(..self, state:, selector:, queue:)))
+      loop(rearm_beat(arm_idle(Self(..self, state:, selector:, queue:))))
     }
   }
 }
@@ -1252,6 +1349,42 @@ fn arm_idle(self: Self(state, message)) -> Self(state, message) {
           sending: message,
         ),
       )
+  }
+}
+
+/// Arm the heartbeat, if there is one.
+///
+/// Called once at start and once at the end of each tick's handler, which is
+/// the whole of the fixed-delay rule: the interval always measures forward
+/// from a moment the actor was free, never from a moment on a grid it may
+/// have fallen behind.
+fn arm_beat(self: Self(state, message)) -> Self(state, message) {
+  case self.beat {
+    None -> self
+    Some(Periodic(every_ms:, message:)) ->
+      Self(
+        ..self,
+        timers: timer.set(
+          self.timers,
+          for: BeatTimer,
+          after: every_ms,
+          sending: message,
+        ),
+      )
+  }
+}
+
+/// Arm the next heartbeat, but only after a tick's own handler has returned.
+///
+/// Every handled message passes through here and all but the tick's leave
+/// with nothing done, which is the difference between the heartbeat and the
+/// loop timeout: ordinary traffic must not push the next beat out. The flag
+/// is cleared first so that nothing further down this handler's work can arm
+/// a second one.
+fn rearm_beat(self: Self(state, message)) -> Self(state, message) {
+  case self.beating {
+    Quiet -> self
+    BeatPending -> arm_beat(Self(..self, beating: Quiet))
   }
 }
 

@@ -321,6 +321,23 @@ type Clockwork {
   /// Cancel a named timeout.
   CancelNamed(name: String)
 
+  /// Arm a periodic timeout that rings its own name over and over.
+  PeriodicIn(name: String, ms: Int)
+
+  /// Arm a periodic timeout and queue a `Doze` behind it, which is how a
+  /// test forces a tick to be genuinely in flight when it is cancelled.
+  /// `cancelling` decides whether the doze ends the series or leaves it
+  /// alone, and is the single line the flush test and its control differ by.
+  TripPeriodic(name: String, ms: Int, cancelling: Cancelling)
+
+  /// Sleep long enough for the tick armed by `TripPeriodic` to have landed
+  /// in the mailbox, then do what that arming asked for. Handled from the
+  /// injected queue, so it runs before the loop looks at the mailbox at all.
+  DozePeriodic(name: String, cancelling: Cancelling)
+
+  /// Stop the machine, with whatever timers it still has armed.
+  Cease
+
   /// A timeout fired. Recorded in the log.
   Rang(name: String)
 
@@ -340,6 +357,16 @@ type Clockwork {
 
   /// Report which timeouts have rung, oldest first.
   Rings(reply: Subject(List(String)))
+}
+
+/// Whether a `TripPeriodic` doze ends the series it armed.
+///
+/// The flush test and its control are the same scenario with this value
+/// flipped, which is the only way "the fire was flushed" says anything: a
+/// timer that never fired at all would pass the flush test on its own.
+type Cancelling {
+  CancelIt
+  LeaveIt
 }
 
 fn clockwork_handler(
@@ -374,6 +401,28 @@ fn clockwork_handler(
       |> sm.with_named_timeout(name:, after: ms, sending: Rang(name))
 
     CancelNamed(name:) -> sm.keep(log) |> sm.cancel_timeout(name:)
+
+    PeriodicIn(name:, ms:) ->
+      sm.keep(log)
+      |> sm.with_periodic_timeout(name:, every: ms, sending: Rang(name))
+
+    // The arm and the doze are one chain, so the doze is handled from the
+    // injected queue — ahead of the mailbox the tick is sitting in. Without
+    // it the cancel usually wins the race and the flush is never exercised.
+    TripPeriodic(name:, ms:, cancelling:) ->
+      sm.keep(log)
+      |> sm.with_periodic_timeout(name:, every: ms, sending: Rang(name))
+      |> sm.then_handle(DozePeriodic(name:, cancelling:))
+
+    DozePeriodic(name:, cancelling:) -> {
+      process.sleep(40)
+      case cancelling {
+        CancelIt -> sm.keep(log) |> sm.cancel_timeout(name:)
+        LeaveIt -> sm.keep(log)
+      }
+    }
+
+    Cease -> sm.stop()
 
     Rang(name:) -> sm.keep([name, ..log])
 
@@ -574,6 +623,156 @@ pub fn named_timeouts_are_independent_of_each_other_test() -> Nil {
   sm.send(started.data, CancelNamed("dinner"))
   process.sleep(250)
   assert sm.call(started.data, waiting: 1000, sending: Rings) == ["supper"]
+
+  discard(started.pid)
+}
+
+// ------------------------------------------------------- periodic timeouts
+
+pub fn a_periodic_timeout_rings_over_and_over_test() -> Nil {
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 30))
+  process.sleep(250)
+  let rings = sm.call(started.data, waiting: 1000, sending: Rings)
+
+  // A one-shot named timeout under the same name would give exactly one,
+  // which is the failure this count is chosen to separate from.
+  assert list.length(rings) >= 3
+  assert list.all(rings, fn(name) { name == "tick" })
+
+  discard(started.pid)
+}
+
+pub fn a_periodic_timeout_survives_state_changes_test() -> Nil {
+  // The heartbeat that must keep beating while the machine moves between
+  // phases is the whole reason this kind exists, so the transitions here
+  // are the assertion rather than scenery.
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 30))
+  sm.send(started.data, Move(Beta))
+  sm.send(started.data, Move(Gamma))
+  process.sleep(250)
+
+  assert list.length(sm.call(started.data, waiting: 1000, sending: Rings)) >= 3
+  assert view(started.pid).0 == "gamma"
+
+  discard(started.pid)
+}
+
+pub fn a_periodic_timeout_is_cancelled_by_its_name_test() -> Nil {
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 30))
+  process.sleep(150)
+  sm.send(started.data, CancelNamed("tick"))
+  let rung = sm.call(started.data, waiting: 1000, sending: Rings)
+
+  // It was running, and then it was not: the first assertion is what stops
+  // the second from passing against a timer that never started.
+  assert list.length(rung) >= 1
+  process.sleep(250)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == rung
+
+  discard(started.pid)
+}
+
+pub fn a_cancel_inside_a_handler_flushes_the_tick_in_flight_test() -> Nil {
+  // The tick lands in the mailbox during the doze and the cancel runs after
+  // it: the fire cannot be recalled, so the only thing that can keep it out
+  // of the handler is the generation stamp the timer book drops it on.
+  let started = start_clockwork()
+
+  sm.send(started.data, TripPeriodic("tick", 5, CancelIt))
+  process.sleep(250)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  discard(started.pid)
+}
+
+pub fn the_flush_control_delivers_the_tick_when_nothing_cancels_it_test() -> Nil {
+  // The same scenario with `LeaveIt` for `CancelIt`. Without this, a
+  // periodic timeout that silently never armed would pass the flush test.
+  let started = start_clockwork()
+
+  sm.send(started.data, TripPeriodic("tick", 5, LeaveIt))
+  process.sleep(250)
+  let rings = sm.call(started.data, waiting: 1000, sending: Rings)
+  assert list.first(rings) == Ok("tick")
+
+  discard(started.pid)
+}
+
+pub fn re_arming_a_periodic_timeout_replaces_its_interval_test() -> Nil {
+  // Two armings of one name, fast then slow. If the second added a timer
+  // rather than replacing one, the fast series would still be running and
+  // the window below would be full of ticks.
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 20))
+  sm.send(started.data, PeriodicIn("tick", 2000))
+  process.sleep(250)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  discard(started.pid)
+}
+
+pub fn the_re_arm_control_shows_the_fast_interval_would_have_rung_test() -> Nil {
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 20))
+  process.sleep(250)
+  assert list.length(sm.call(started.data, waiting: 1000, sending: Rings)) >= 3
+
+  discard(started.pid)
+}
+
+pub fn a_one_shot_named_timeout_replaces_a_periodic_one_test() -> Nil {
+  // The two kinds share a name space, so this is a conversion rather than a
+  // second timer — and the re-arm that runs after each tick must not put
+  // the series back once the handler has said one-shot.
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 20))
+  sm.send(started.data, NamedTimeoutIn("tick", 20))
+  process.sleep(250)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == ["tick"]
+
+  discard(started.pid)
+}
+
+pub fn a_periodic_timeout_dies_with_the_machine_test() -> Nil {
+  // A machine that stops while a periodic timeout is armed stays stopped:
+  // the timer fires into a subject its own dead process owned, and nothing
+  // about the series outlives the exit.
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 20))
+  process.sleep(80)
+  sm.send(started.data, Cease)
+
+  process.sleep(150)
+  assert !process.is_alive(started.pid)
+}
+
+pub fn suspension_freezes_a_periodic_timeout_too_test() -> Nil {
+  // A suspended machine is frozen, not quiet. The ticks it could not have
+  // acted on are not owed to it on resume, so the series restarts from full
+  // rather than delivering a backlog.
+  let started = start_clockwork()
+
+  sm.send(started.data, PeriodicIn("tick", 400))
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  system.suspend(started.pid)
+  process.sleep(900)
+  system.resume(started.pid)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  // And the series was put back rather than dropped.
+  process.sleep(900)
+  assert list.length(sm.call(started.data, waiting: 1000, sending: Rings)) >= 2
 
   discard(started.pid)
 }
