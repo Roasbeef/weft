@@ -1,6 +1,6 @@
 # src/weft — the module graph
 
-Four public modules and two internal ones. The parent directory's
+Five public modules here plus two internal ones. The parent directory's
 `weft.gleam` (the run engine) is documented here too, since the graph only
 makes sense whole.
 
@@ -30,7 +30,8 @@ makes sense whole.
   injected-message queue (continues), the timer book for its idle timeout
   and its heartbeat (`periodic(every:, sending:)`, a fixed-delay tick armed
   at start and again after each tick's own handler returns), the sys plane,
-  hibernation. Reuses `gleam_otp`'s `Started`/`StartError`/
+  hibernation. `with_timer_source` decides which clock both timers ride;
+  the default is the wall clock. Reuses `gleam_otp`'s `Started`/`StartError`/
   `ChildSpecification` for interop — a weft actor slots into an upstream
   supervisor unchanged.
 - **`weft/state_machine`** — typed gen_statem. Its own loop (a sibling of
@@ -39,7 +40,8 @@ makes sense whole.
   fourth kind is periodic: a named timeout carrying `Repeating` rather
   than `OneShot`, whose delivery keeps its arming record and whose key is
   armed again by `rearm_repeating` after the handler's own timer actions
-  have run, so the handler's word about the name is final.
+  have run, so the handler's word about the name is final. All four kinds
+  ride the builder's `with_timer_source`, wall clock by default.
 - **`weft/event_manager`** — typed gen_event, built ON `weft/actor` (its
   state is the handler list; it has no loop of its own). Reaches into
   `weft/internal/sys` for exactly one thing: `warn`, so a dropped handler
@@ -65,9 +67,22 @@ makes sense whole.
   attempt to the next and hands it back as `RanOut` on expiry. The
   interval is an `Interval` — `Fixed`, or `Doubling(from:, to:)` for a
   wait long enough that a flat interval is thousands of probes.
+- **`weft/timer`** — one type and no functions: `Source`, either
+  `WallClock` (`process.send_after`, and the only shape with a cancel
+  handle) or `Injected(after:)`, a caller-supplied
+  `fn(delay_ms, wake) -> Nil` deliberately shaped like a host system's own
+  time capability so it needs no adapter. An injected wake may be late or
+  duplicated and is dropped when stale; one never delivered costs liveness
+  for that arming alone. Imports nothing, so it is a leaf of the graph.
 - **`weft/internal/timer`** — the named-timer book: generation-stamped
   fires, `accept` as the only consumption path. Cancel-with-flush is two
   halves: `cancel` stops what it can, `accept` drops what it could not.
+  `new_on(subject, source)` fixes the clock for the life of the book
+  (`new` is `new_on(_, WallClock)`); the `Source` reaches exactly one
+  function, `set`, and an `Entry`'s `Handle` is `Cancellable` or
+  `Uncancellable` accordingly. Under `Injected` nothing can stop a
+  superseded arming, so the generation check is the whole defence rather
+  than a second line.
 - **`weft/internal/sys`** + `src/weft_sys_ffi.erl` — the system-message
   plane (`{system, From, Request}` selection, get_state/get_status/
   suspend/resume replies, observer status shape), `hibernate`, `warn`. All
@@ -84,8 +99,11 @@ makes sense whole.
   discriminated by pid); each owner's `cancel` runs on a disposable linked
   helper whose `EXIT` is bookkeeping, not an outcome.
 - Actor: one user-typed `message` per actor; system messages arrive as
-  `sys.Incoming` via a record selector, timers as `timer.Fired(TimerKey,
-  message)`.
+  `sys.Incoming` via a record selector, timers as `book.Fired(TimerKey,
+  message)` (the internal book is imported as `book` in both loops, since
+  `weft/timer` takes the name `timer` there). On an injected source that
+  `Fired` is sent by the wake the source runs, from whatever process runs
+  it, and is otherwise indistinguishable.
 - State machine: same shape as the actor, with `TimerKey` covering
   `StateTimeout`/`EventTimeout`/`NamedTimeout(String)`; a periodic timeout
   shares the `NamedTimeout` key space and is told apart by the `Cadence`
@@ -96,8 +114,10 @@ makes sense whole.
 
 ## Invariants that break things when violated
 
-1. **Every `timer.Fired` goes through `timer.accept`.** A loop that
-   selects fires straight into its handler has the stale-timer bug back.
+1. **Every `Fired` goes through `accept`.** A loop that selects fires
+   straight into its handler has the stale-timer bug back — and on an
+   injected source it has no other defence at all, because no cancel there
+   ever stops a wake.
 2. **`sys.selecting` merges LAST into any selector.** A later arm can
    shadow it, and a loop invisible to `sys` is a debugging dead end.
 3. **`sys.handle` sends the sys reply itself.** Replying again from a loop
@@ -146,11 +166,18 @@ makes sense whole.
 
 ```
 weft ──────────────► gleam_erlang/process, internal/sys
-weft/actor ────────► internal/{sys,timer}, gleam_otp (types only)
-weft/state_machine ► internal/{sys,timer}, gleam_otp (types only)
+weft/actor ────────► internal/{sys,timer}, weft/timer, gleam_otp (types)
+weft/state_machine ► internal/{sys,timer}, weft/timer, gleam_otp (types)
 weft/event_manager ► weft/actor, internal/sys (warn ONLY)
 weft/poll ─────────► gleam_erlang/process (sleep only)
+weft/timer ────────► nothing
+internal/timer ────► gleam_erlang/process, weft/timer
 ```
+
+The internal book depending on a *public* module is the one inversion in
+this picture and is deliberate: `Source` is what a consumer writes, so it
+cannot live behind `internal_modules`, and `weft/timer` imports nothing so
+there is no cycle to arrange around.
 
 Adding an edge not in this picture is a design change: it goes through
 `docs/plan.md` and a reviewer, not a quiet import.
