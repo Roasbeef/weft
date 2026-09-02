@@ -191,6 +191,17 @@ case
 It owns no process; a wait that could be a message should be a
 `weft/state_machine` state with a timeout instead.
 
+A wait that belongs to a system with its own injected time capability
+cannot consult the operating system without either hanging that system's
+simulation or making it non-deterministic, so the clock is a value:
+`poll.Clock(now:, sleep:)`, `poll.monotonic()` for the one `until` uses,
+and `poll.until_on` for the caller's own. `poll.fold_until` is the same
+loop with the probe threading a state from one attempt to the next —
+the handles already settled, the token the last exchange handed back —
+and expiry gives that state back (`RanOut`) rather than only reporting
+that time ran out. Both take an `Interval`, so a long wait can back off
+(`Doubling(from: 25, to: 250)`) instead of probing flat.
+
 ## Relationship to gleam_otp
 
 Weft is not a fork and not a competing framework. Its types interoperate

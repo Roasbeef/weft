@@ -58,6 +58,13 @@ makes sense whole.
   process (`until` with an immediate first attempt, a last attempt at the
   deadline, `Fail` distinct from `Retry`). Owns no process; depends only
   on `gleam_erlang/process` for the sleep and a monotonic-clock external.
+  Three entry points over one loop: `until` on the monotonic clock,
+  `until_on` on an injected `Clock` (a `now`/`sleep` pair, so a wait
+  belonging to a system with its own time capability runs under that
+  system's simulation), and `fold_until`, which threads a state from one
+  attempt to the next and hands it back as `RanOut` on expiry. The
+  interval is an `Interval` — `Fixed`, or `Doubling(from:, to:)` for a
+  wait long enough that a flat interval is thousands of probes.
 - **`weft/internal/timer`** — the named-timer book: generation-stamped
   fires, `accept` as the only consumption path. Cancel-with-flush is two
   halves: `cancel` stops what it can, `accept` drops what it could not.

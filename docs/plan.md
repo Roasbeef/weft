@@ -16,6 +16,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft/poll` | loom#159 phase 2 | `0.4.0` | Bounded synchronous polling for foreground waits; owns no process |
 | `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.3.1` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.3.1), `cancel_when_exits`; many owners per task |
 | Periodic timeouts | loom#159 phase 3 | `0.4.1` | `sm.with_periodic_timeout` and `actor.periodic`; fixed delay, re-armed after the handler |
+| Injected clocks for `weft/poll` | loom#159 phase 3 | `0.4.1` | `Clock`/`monotonic`, `until_on`, `fold_until`, `Interval` |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -124,6 +125,35 @@ came back for, and it settled these:
 - **Suspension freezes a periodic timeout like every other**, re-arming
   from full on resume rather than delivering the ticks the frozen process
   could not have acted on.
+
+## Rulings made for the injected poll clock (0.4.1)
+
+- **The clock and the sleep are one value.** A wait that read a simulated
+  clock and rested on the real one would burn wall time to make no logical
+  progress; one that read the real clock and rested by stepping a simulated
+  one would never end. `Clock(now:, sleep:)` makes them a single decision,
+  and `monotonic()` is the pair `until` has always used.
+- **`until` keeps its exact signature.** It is published and consumed, and
+  the injected form is an addition rather than a generalisation callers have
+  to be migrated through. It is now written as `until_on(monotonic(), ...)`,
+  so there is one loop and not two to keep honest.
+- **`fold_until` is the engine and `until_on` the special case** where the
+  carried state is `Nil`. The consumer that asked for this was a wait
+  accumulating which of its handles had already settled, and a
+  `fn() -> Attempt` cannot express that without a process or a mutable cell.
+- **Expiry hands the state back** (`RanOut`) rather than reporting only that
+  time ran out. A wait that half-succeeded should not have to start again to
+  find out what it got, and the caller who wanted the old behaviour still
+  has `Expired` on the stateless form.
+- **The interval is a value, not a number**, because the waits that need an
+  injected clock are the long ones and a long wait probing at a short flat
+  interval is thousands of reads. `Doubling(from:, to:)` is the cheapest
+  schedule that fixes that without a parameter nobody can pick.
+- **A clock whose `now` never moves is a wait that never expires**, and that
+  is documented as a fact about the clock rather than defended against. A
+  loop that also subtracted its own nap from the budget would terminate on a
+  frozen clock, but it would then be measuring two different times at once
+  and reporting neither.
 
 ## Deferred, deliberately
 
