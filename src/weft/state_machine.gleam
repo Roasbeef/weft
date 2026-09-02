@@ -1,5 +1,5 @@
 //// A typed `gen_statem`: a state ADT, a data value, postponed events, and
-//// the three timeout kinds, on a receive loop weft owns.
+//// the four timeout kinds, on a receive loop weft owns.
 ////
 //// ## Why Gleam ships half of gen_statem's surface
 ////
@@ -40,7 +40,7 @@
 ////
 //// ## The timeout taxonomy
 ////
-//// Three kinds, distinguished only by what cancels them. All three are the
+//// Four kinds, distinguished only by what cancels them. All four are the
 //// same mechanism underneath — a generation-stamped entry in the timer book
 //// — so a fire that beat its own cancellation into the mailbox is
 //// recognised and dropped rather than handled.
@@ -50,8 +50,10 @@
 //// | State | `with_state_timeout` | a transition to a **different** state |
 //// | Event | `with_event_timeout` | the **next event of any kind** |
 //// | Named | `with_named_timeout` | `cancel_timeout` under the same name |
+//// | Periodic | `with_periodic_timeout` | `cancel_timeout` under the same name |
 ////
-//// Each also dies by firing, since all three are one-shot.
+//// The first three also die by firing, since they are one-shot. The
+//// periodic one is the exception, and the section below says how.
 ////
 //// The state timeout's rule is gen_statem's, down to the awkward corner:
 //// `transition(to: s, data: d)` where `s` is the state the machine is
@@ -69,6 +71,36 @@
 //// A named timeout survives everything until it fires or is cancelled by
 //// name. It is the one for a deadline that belongs to a piece of work
 //// rather than to a state.
+////
+//// ## The periodic timeout
+////
+//// A periodic timeout is a named timeout that re-arms itself. It shares the
+//// name space with `with_named_timeout` — one name, one timer, and
+//// `cancel_timeout` ends either kind — so arming a name periodically where
+//// a one-shot was armed replaces it, and the other way round.
+////
+//// The cadence is **fixed delay**, not fixed rate. The next fire is armed
+//// once the handler for this one has returned, so the interval measures the
+//// gap between the end of one tick and the start of the next. A handler
+//// slower than its own interval therefore slows the ticks down rather than
+//// accumulating a backlog of them in the mailbox, which is what a heartbeat
+//// wants: two heartbeats delivered back to back say nothing a single one
+//// did not. A caller that needs fires on a grid — a sampler whose
+//// timestamps must be evenly spaced — wants a schedule, and a schedule is a
+//// different primitive that this is deliberately not.
+////
+//// The re-arm happens *after* the step's own timer actions, so the
+//// handler's word is final: a handler that cancels the name stops the
+//// ticks, one that arms the name again with a new interval changes them,
+//// and one that arms it with `with_named_timeout` converts it to a
+//// one-shot. Cancellation is not special either — the fire that beat the
+//// cancel into the mailbox carries a stale generation stamp and dies in the
+//// timer book like any other, so a tick can never be handled after the
+//// handler that cancelled it returned.
+////
+//// Being a named timeout, a periodic one survives state changes. A
+//// heartbeat that must keep beating while the machine moves between phases
+//// is exactly what it is for.
 ////
 //// ## Postpone, and the replay contract
 ////
@@ -300,8 +332,23 @@ type Target(state, data) {
 
 /// One change to the timer book, applied in the order the caller wrote it.
 type TimeoutAction(message) {
-  Arm(key: TimerKey, after_ms: Int, message: message)
+  Arm(key: TimerKey, after_ms: Int, message: message, cadence: Cadence)
   Disarm(key: TimerKey)
+}
+
+/// Whether a timer stops when it fires or arms itself again.
+///
+/// This is what separates a periodic timeout from the other three kinds,
+/// and it is carried rather than inferred from the key because a periodic
+/// timeout and a one-shot named one share a name space: the same key may be
+/// armed either way, and only the arming knows which.
+type Cadence {
+  /// Fires once. The arming is spent when the fire is delivered.
+  OneShot
+
+  /// Fires, and is armed again for the same interval once the handler for
+  /// that fire has returned — fixed delay, per this module's header.
+  Repeating
 }
 
 /// The keys the machine arms timers under.
@@ -461,7 +508,7 @@ pub fn with_state_timeout(
   after ms: Int,
   sending message: message,
 ) -> Step(state, data, message, postponing) {
-  timing(step, Arm(key: StateTimeout, after_ms: ms, message:))
+  timing(step, Arm(key: StateTimeout, after_ms: ms, message:, cadence: OneShot))
 }
 
 /// Send the machine `message` after `ms` milliseconds with no events at all.
@@ -485,7 +532,7 @@ pub fn with_event_timeout(
   after ms: Int,
   sending message: message,
 ) -> Step(state, data, message, postponing) {
-  timing(step, Arm(key: EventTimeout, after_ms: ms, message:))
+  timing(step, Arm(key: EventTimeout, after_ms: ms, message:, cadence: OneShot))
 }
 
 /// Send the machine `message` after `ms` milliseconds, whatever else
@@ -511,15 +558,64 @@ pub fn with_named_timeout(
   after ms: Int,
   sending message: message,
 ) -> Step(state, data, message, postponing) {
-  timing(step, Arm(key: NamedTimeout(name:), after_ms: ms, message:))
+  timing(
+    step,
+    Arm(key: NamedTimeout(name:), after_ms: ms, message:, cadence: OneShot),
+  )
 }
 
-/// Cancel the named timeout armed under `name`.
+/// Send the machine `message` every `ms` milliseconds until it is cancelled.
+///
+/// This is the heartbeat: a named timeout that arms itself again once the
+/// handler for each fire has returned. The interval is a *delay* rather than
+/// a rate — it measures the gap between the end of one tick and the start of
+/// the next — so a handler slower than its own interval slows the ticks
+/// down instead of building a backlog of them in the mailbox. This module's
+/// header has the whole of that argument, and the reason a caller who needs
+/// evenly spaced timestamps wants something else.
+///
+/// The name is the one `with_named_timeout` uses, so arming a name
+/// periodically replaces whatever was armed under it, and `cancel_timeout`
+/// ends it. Re-arming under the same name is therefore idempotent in the
+/// sense that matters: there is one timer per name, never two, however many
+/// times a handler arms it.
+///
+/// Applying this to a `stop` value does nothing.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // A liveness probe that keeps beating across every phase the machine
+/// // moves through, and stops when the machine stops caring.
+/// sm.keep(data)
+/// |> sm.with_periodic_timeout(name: "heartbeat", every: 30_000, sending: Beat)
+/// ```
+///
+/// ```gleam
+/// // The tick that stops itself: cancelling from inside the handler its own
+/// // fire is running in is the supported way to end the series.
+/// Draining, Beat -> sm.keep(data) |> sm.cancel_timeout(name: "heartbeat")
+/// ```
+pub fn with_periodic_timeout(
+  step: Step(state, data, message, postponing),
+  name name: String,
+  every ms: Int,
+  sending message: message,
+) -> Step(state, data, message, postponing) {
+  timing(
+    step,
+    Arm(key: NamedTimeout(name:), after_ms: ms, message:, cadence: Repeating),
+  )
+}
+
+/// Cancel the timeout armed under `name`, periodic or one-shot.
 ///
 /// Cancelling a name nothing is armed under is a no-op, which is what lets a
 /// handler cancel unconditionally rather than tracking whether it armed
 /// anything. A fire already in flight when this runs is dropped by the timer
-/// book rather than handled.
+/// book rather than handled — including the periodic fire whose own handler
+/// is doing the cancelling, which is why ending a heartbeat from inside a
+/// tick needs no second thought.
 ///
 /// Applying this to a `stop` value does nothing.
 ///
@@ -1180,12 +1276,20 @@ type Self(state, data, message) {
     /// be asked, and a suspension has to be able to disarm every timer and
     /// then put them all back — see `handle_system`.
     arming: Dict(TimerKey, Arming(message)),
+    /// The periodic timeout whose fire the event handler is running right
+    /// now, waiting to be armed again once that handler's own timer actions
+    /// have been applied. It is a field rather than an argument because the
+    /// handler's step is interpreted by `commit`, which recurses through
+    /// enter callbacks, and the re-arm must happen once at the outermost
+    /// interpretation and not once per enter call. `None` between events.
+    repeating: Option(TimerKey),
   )
 }
 
-/// The arming of one timer, remembered so that a resume can reinstate it.
+/// The arming of one timer, remembered so that a resume can reinstate it,
+/// and so that a delivered periodic fire knows what to arm itself with next.
 type Arming(message) {
-  Arming(after_ms: Int, message: message)
+  Arming(after_ms: Int, message: message, cadence: Cadence)
 }
 
 /// Everything the loop can receive, in one type, so that a single selector
@@ -1274,6 +1378,7 @@ fn initialise_machine(
           trapping: builder.trap_exits,
           timers: timer.new(process.new_subject()),
           arming: dict.new(),
+          repeating: None,
         )
 
       // The queue is already loaded, so releasing the parent here cannot let
@@ -1498,7 +1603,7 @@ fn handle_system(
 /// resume.
 fn rearm_all(self: Self(state, data, message)) -> Self(state, data, message) {
   use self, key, arming <- dict.fold(self.arming, self)
-  arm(self, key, arming.after_ms, arming.message)
+  arm(self, key, arming.after_ms, arming.message, arming.cadence)
 }
 
 /// Decide what a trapped exit signal means.
@@ -1540,12 +1645,34 @@ fn handle_fired(
     timer.Stale(timers:) -> loop(Self(..self, timers:))
 
     timer.Deliver(timers:, key:, message:) -> {
-      // These are one-shot timers, so the arming record has to follow the
-      // book's own entry out; leaving it would have a resume re-arm a
-      // timeout that has already fired.
-      let arming = dict.delete(self.arming, key)
-      handle(Self(..self, timers:, arming:), message)
+      let self = Self(..self, timers:)
+
+      case cadence_of(self, key) {
+        // A one-shot arming is spent by its own delivery, so the record has
+        // to follow the book's entry out; leaving it would have a resume
+        // re-arm a timeout that has already fired.
+        OneShot ->
+          handle(Self(..self, arming: dict.delete(self.arming, key)), message)
+
+        // A periodic arming is not spent: it is the description the re-arm
+        // reads back once the handler has returned, so it stays and the key
+        // is remembered until `rearm_repeating` consumes it.
+        Repeating -> handle(Self(..self, repeating: Some(key)), message)
+      }
     }
+  }
+}
+
+/// The cadence the timer under `key` was armed with.
+///
+/// `arm` and `disarm` write and delete the book entry and the arming record
+/// together, so a key the book has just delivered for always has a record.
+/// The missing case is unreachable by construction and answers `OneShot`,
+/// which is the reading that arms nothing further.
+fn cadence_of(self: Self(state, data, message), key: TimerKey) -> Cadence {
+  case dict.get(self.arming, key) {
+    Ok(Arming(cadence:, ..)) -> cadence
+    Error(Nil) -> OneShot
   }
 }
 
@@ -1595,7 +1722,7 @@ fn commit(
       case self.state == from {
         True -> {
           let self = Self(..self, queue: list.append(injected, self.queue))
-          loop(apply_timeouts(self, timeouts))
+          loop(rearm_repeating(apply_timeouts(self, timeouts)))
         }
         False -> changed_state(self, from, injected, timeouts)
       }
@@ -1643,7 +1770,10 @@ fn retarget(
 ///    messages this step injected. Arrival order is restored by the single
 ///    reverse; the postponed queue is emptied, which is what makes replay
 ///    exactly-once.
-/// 3. The enter callback runs, and anything it injects goes in front of all
+/// 3. A periodic timeout whose fire is being handled is armed again, after
+///    the step's actions and before the enter callback, so that either
+///    callback can still end the series by cancelling the name.
+/// 4. The enter callback runs, and anything it injects goes in front of all
 ///    of it — the depth-first rule, applied to the block that was written
 ///    last.
 fn changed_state(
@@ -1656,7 +1786,7 @@ fn changed_state(
   let replayed = list.reverse(self.postponed)
   let queue = list.append(injected, list.append(replayed, self.queue))
   let self = apply_timeouts(Self(..self, queue:, postponed: []), timeouts)
-  enter(self, from:, to: self.state)
+  enter(rearm_repeating(self), from:, to: self.state)
 }
 
 /// Run the enter callback, if there is one, and interpret what it returns.
@@ -1684,8 +1814,42 @@ fn apply_timeouts(
 ) -> Self(state, data, message) {
   use self, action <- list.fold(actions, self)
   case action {
-    Arm(key:, after_ms:, message:) -> arm(self, key, after_ms, message)
+    Arm(key:, after_ms:, message:, cadence:) ->
+      arm(self, key, after_ms, message, cadence)
     Disarm(key:) -> disarm(self, key)
+  }
+}
+
+/// Arm the periodic timeout whose fire has just been handled, if the handler
+/// left it wanting to run again.
+///
+/// Running after the step's own timer actions is what makes the handler's
+/// word final. A handler that cancelled the name left no arming record, so
+/// nothing is armed here and the series ends. A handler that replaced it
+/// with a one-shot under the same name left a `OneShot` record that
+/// `apply_timeouts` has already armed, and arming it again as a repeating
+/// timer would quietly resurrect the series it was meant to end. Only a
+/// record still asking to repeat is armed, and it is armed from the interval
+/// the handler left in place rather than the one that fired.
+///
+/// The pending key is cleared first, so an enter callback interpreted
+/// further down the same `commit` chain cannot arm it a second time.
+fn rearm_repeating(
+  self: Self(state, data, message),
+) -> Self(state, data, message) {
+  case self.repeating {
+    None -> self
+
+    Some(key) -> {
+      let self = Self(..self, repeating: None)
+      case dict.get(self.arming, key) {
+        Ok(Arming(after_ms:, message:, cadence: Repeating)) ->
+          arm(self, key, after_ms, message, Repeating)
+
+        Ok(Arming(cadence: OneShot, ..)) -> self
+        Error(Nil) -> self
+      }
+    }
   }
 }
 
@@ -1698,11 +1862,12 @@ fn arm(
   key: TimerKey,
   after_ms: Int,
   message: message,
+  cadence: Cadence,
 ) -> Self(state, data, message) {
   Self(
     ..self,
     timers: timer.set(self.timers, for: key, after: after_ms, sending: message),
-    arming: dict.insert(self.arming, key, Arming(after_ms:, message:)),
+    arming: dict.insert(self.arming, key, Arming(after_ms:, message:, cadence:)),
   )
 }
 

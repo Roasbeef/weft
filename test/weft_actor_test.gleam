@@ -506,6 +506,116 @@ pub fn idle_timeout_is_reset_by_traffic_test() -> Nil {
   discard(started.pid)
 }
 
+pub fn the_heartbeat_beats_over_and_over_test() -> Nil {
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.periodic(every: 30, sending: Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  // A loop timeout of the same length would give exactly one, since the
+  // count only moves when the actor is quiet and it is not quiet after the
+  // first bump. Three is what separates the two.
+  process.sleep(250)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 3
+
+  discard(started.pid)
+}
+
+pub fn traffic_does_not_reset_the_heartbeat_test() -> Nil {
+  // The mirror image of `idle_timeout_is_reset_by_traffic_test`, which runs
+  // exactly this traffic against exactly this interval and asserts zero.
+  // The heartbeat measures nothing about the mailbox, so it fires anyway.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.periodic(every: 80, sending: Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  list.each(list.repeat(Nil, 6), fn(_attempt) {
+    process.send(started.data, Poke)
+    process.sleep(20)
+  })
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 1
+
+  discard(started.pid)
+}
+
+pub fn a_beat_resets_the_loop_timeout_like_any_message_test() -> Nil {
+  // A beat is an ordinary message by the time the handler sees it, so it
+  // resets the loop timeout exactly as a client request would. An actor
+  // wired with both therefore wants the beat interval shorter than the idle
+  // one only if it means to keep itself out of idle, which is what this
+  // pair of tests fixes as behaviour rather than accident.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.idle_timeout(200, Halt)
+    |> actor.periodic(every: 20, sending: Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.sleep(300)
+  assert process.is_alive(started.pid)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 5
+
+  discard(started.pid)
+}
+
+pub fn the_loop_timeout_control_kills_the_same_actor_without_a_heartbeat_test() -> Nil {
+  // The same actor with the heartbeat line removed. Without this, an
+  // `actor.periodic` that quietly did nothing would pass the test above.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.idle_timeout(200, Halt)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.sleep(600)
+  assert !process.is_alive(started.pid)
+}
+
+pub fn a_beat_that_stops_the_actor_ends_the_series_test() -> Nil {
+  // The only way to end a heartbeat is to end the actor, which is the
+  // deliberate limit on this setting: the interval belongs to the builder,
+  // so a handler's word about it is `stop` and nothing finer.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.periodic(every: 30, sending: Halt)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  process.sleep(200)
+  assert !process.is_alive(started.pid)
+}
+
+pub fn suspension_freezes_the_heartbeat_too_test() -> Nil {
+  // A suspended actor is frozen, not merely quiet. The beats it could not
+  // have acted on are not owed to it on resume, so the series restarts from
+  // full rather than delivering a backlog.
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.periodic(every: 400, sending: Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  system.suspend(started.pid)
+  process.sleep(900)
+  system.resume(started.pid)
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 0
+
+  // And the series was put back rather than dropped.
+  process.sleep(900)
+  assert actor.call(started.data, waiting: 1000, sending: Count) >= 2
+
+  discard(started.pid)
+}
+
 pub fn hibernation_does_not_stop_the_actor_answering_test() -> Nil {
   let assert Ok(started) =
     actor.new(0)

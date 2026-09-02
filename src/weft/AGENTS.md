@@ -27,13 +27,19 @@ makes sense whole.
   plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
   and slot scheduling would contort an actor loop.
 - **`weft/actor`** — the superset actor. Owns the house receive loop:
-  injected-message queue (continues), the timer book for its idle timeout,
-  the sys plane, hibernation. Reuses `gleam_otp`'s `Started`/`StartError`/
+  injected-message queue (continues), the timer book for its idle timeout
+  and its heartbeat (`periodic(every:, sending:)`, a fixed-delay tick armed
+  at start and again after each tick's own handler returns), the sys plane,
+  hibernation. Reuses `gleam_otp`'s `Started`/`StartError`/
   `ChildSpecification` for interop — a weft actor slots into an upstream
   supervisor unchanged.
 - **`weft/state_machine`** — typed gen_statem. Its own loop (a sibling of
-  the actor's, not a wrapper): postpone replay, the three-timeout
-  discipline, enter callbacks. Consumes both internals directly.
+  the actor's, not a wrapper): postpone replay, the four-timeout
+  discipline, enter callbacks. Consumes both internals directly. The
+  fourth kind is periodic: a named timeout carrying `Repeating` rather
+  than `OneShot`, whose delivery keeps its arming record and whose key is
+  armed again by `rearm_repeating` after the handler's own timer actions
+  have run, so the handler's word about the name is final.
 - **`weft/event_manager`** — typed gen_event, built ON `weft/actor` (its
   state is the handler list; it has no loop of its own). Reaches into
   `weft/internal/sys` for exactly one thing: `warn`, so a dropped handler
@@ -74,7 +80,10 @@ makes sense whole.
   `sys.Incoming` via a record selector, timers as `timer.Fired(TimerKey,
   message)`.
 - State machine: same shape as the actor, with `TimerKey` covering
-  `StateTimeout`/`EventTimeout`/`Named(String)`.
+  `StateTimeout`/`EventTimeout`/`NamedTimeout(String)`; a periodic timeout
+  shares the `NamedTimeout` key space and is told apart by the `Cadence`
+  on its arming record, so one name is one timer and `cancel_timeout` ends
+  either kind. The actor's `TimerKey` covers `IdleTimer` and `BeatTimer`.
 - Event manager: opaque `Message(event)` — `Notify`/`SyncNotify`/
   `AddHandler`/`CountHandlers` — carried by a plain weft actor.
 
@@ -88,7 +97,9 @@ makes sense whole.
    double-answers a blocked debug tool.
 4. **Suspension freezes everything but the debug plane and parent exit** —
    mailbox, injected queues, postponed replay, and timers (disarm on
-   suspend, re-arm from full on resume).
+   suspend, re-arm from full on resume). A periodic timeout is re-armed
+   from full like any other: the ticks a frozen process could not have
+   acted on are not owed to it afterwards.
 5. **Kill-then-join, in that order** (engine `begin_cancel`): all kills
    sent before any `EXIT` is awaited. Owners are the exception by design:
    they are *asked* (their `cancel`, on a helper) and never killed —
@@ -106,15 +117,20 @@ makes sense whole.
    refusal withholds the permit to begin new work, never the witness, so
    an owner published after cancellation is monitored, asked to stop, and
    waited for like any other.
-8. **Depth-first injection everywhere**: what a handler injects runs
+8. **A periodic re-arm runs after the step's own timer actions and before
+   the enter callback.** That ordering is what makes a cancel from inside a
+   tick's own handler final; moving the re-arm later would resurrect a
+   series the handler had just ended, and moving it earlier would let the
+   handler's new interval be overwritten by the one that fired.
+9. **Depth-first injection everywhere**: what a handler injects runs
    before what was already queued; in the state machine the full order
    after a transition is enter-injected, then handler-injected, then
    replayed postponed events (arrival order), then the mailbox.
-9. **The engine's scope unlinks the caller itself in `finish`** — moving
+10. **The engine's scope unlinks the caller itself in `finish`** — moving
    that unlink, or doing it caller-side, reintroduces exit-message noise
    for trapping callers; the drain verdict travels by monitor (the
    `erlang:exit/1` after the unlink), never down the link.
-10. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
+11. **`weft/internal/*` stays internal** (`gleam.toml` seals it) and all
    FFI stays inside it; the exceptions are the engine's
    `erlang:system_info(schedulers_online)` and `erlang:exit/1` externals,
    both stock BIFs argued in place.
