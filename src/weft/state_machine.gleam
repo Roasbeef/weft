@@ -102,6 +102,12 @@
 //// heartbeat that must keep beating while the machine moves between phases
 //// is exactly what it is for.
 ////
+//// All four kinds are armed on the wall clock unless `with_timer_source`
+//// says otherwise. A machine belonging to a system with its own notion of
+//// time — a simulated run, a test driving a fake wheel by hand — passes
+//// that system's `after` in and keeps every rule above; `weft/timer` has
+//// what an injected source is and is not held to.
+////
 //// ## Postpone, and the replay contract
 ////
 //// `postpone` re-queues the event being handled. It is redelivered on the
@@ -238,7 +244,8 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import weft/internal/sys
-import weft/internal/timer
+import weft/internal/timer as book
+import weft/timer.{type Source, WallClock}
 
 // ---------------------------------------------------------------- interop
 
@@ -891,6 +898,8 @@ pub opaque type Builder(state, data, message, return) {
     trap_exits: Bool,
     /// Whether `start` links the new process to its starter.
     linkage: Linkage,
+    /// Which clock every one of this machine's timeouts is armed on.
+    timer_source: Source,
   )
 }
 
@@ -924,6 +933,7 @@ pub fn new(
     name: None,
     trap_exits: False,
     linkage: Linked,
+    timer_source: WallClock,
   )
 }
 
@@ -964,6 +974,7 @@ pub fn new_with_initialiser(
     name: None,
     trap_exits: False,
     linkage: Linked,
+    timer_source: WallClock,
   )
 }
 
@@ -1111,6 +1122,43 @@ pub fn trapping_exits(
   trap: Bool,
 ) -> Builder(state, data, message, return) {
   Builder(..builder, trap_exits: trap)
+}
+
+/// Arm every one of this machine's timeouts through `source` rather than on
+/// the wall clock.
+///
+/// The four timeout kinds are unaffected in every other respect: the state,
+/// event, named and periodic timeouts are the same timeouts, armed and
+/// cancelled by the same steps, flushed by the same generation stamp, and
+/// disarmed and re-armed by a suspension exactly as before. What changes is
+/// who decides that a delay has elapsed.
+///
+/// Reach for this when the machine belongs to a system that owns its own
+/// notion of time — a simulated run stepping a logical clock, a test
+/// driving a fake timer wheel by hand. Such a machine on the wall clock is
+/// not merely awkward to test: it is a second clock in a system built to
+/// have one, and a deterministic run with two clocks is not deterministic.
+///
+/// An injected source cannot be cancelled, only ignored. A wake for a
+/// timeout the machine has since cancelled or re-armed still arrives, and is
+/// dropped by the timer book — which is what the generation stamp has always
+/// been for. `weft/timer` carries the full contract, including that a wake
+/// may be late or duplicated, and that a wake never delivered costs
+/// liveness for that one timeout.
+///
+/// ## Examples
+///
+/// ```gleam
+/// sm.new(Idle, session)
+/// |> sm.with_timer_source(timer.Injected(after: session_after))
+/// |> sm.on_event(handle)
+/// // -> a machine whose timeouts fire when `session_after` says they do
+/// ```
+pub fn with_timer_source(
+  builder: Builder(state, data, message, return),
+  source: Source,
+) -> Builder(state, data, message, return) {
+  Builder(..builder, timer_source: source)
 }
 
 // ------------------------------------------------------------------ start
@@ -1271,7 +1319,7 @@ type Self(state, data, message) {
     trapping: Bool,
     /// The timer book: the three timeout kinds and the flush that makes a
     /// cancelled one safe.
-    timers: timer.Timers(TimerKey, message),
+    timers: book.Timers(TimerKey, message),
     /// What each live timer was armed *with*. The book is opaque and cannot
     /// be asked, and a suspension has to be able to disarm every timer and
     /// then put them all back — see `handle_system`.
@@ -1307,7 +1355,7 @@ type Event(message) {
   Trapped(exit: process.ExitMessage)
 
   /// A timeout fired. It may be stale; the timer book decides.
-  Fired(fired: timer.Fired(TimerKey, message))
+  Fired(fired: book.Fired(TimerKey, message))
 
   /// A message no selector arm claimed. Discarded with a warning.
   Unexpected(message: Dynamic)
@@ -1376,7 +1424,7 @@ fn initialise_machine(
           on_event: builder.on_event,
           on_enter: builder.on_enter,
           trapping: builder.trap_exits,
-          timers: timer.new(process.new_subject()),
+          timers: book.new_on(process.new_subject(), builder.timer_source),
           arming: dict.new(),
           repeating: None,
         )
@@ -1497,14 +1545,14 @@ fn system_selector() -> Selector(sys.Incoming) {
 /// shadow it: a machine invisible to `sys` is a debugging dead end, and that
 /// is not a choice worth offering. The timer arm maps to `Fired` rather than
 /// straight to the handler, because every fire must go through
-/// `timer.accept` — routing one around it puts the stale-fire bug back.
+/// `book.accept` — routing one around it puts the stale-fire bug back.
 fn running_selector(
   self: Self(state, data, message),
 ) -> Selector(Event(message)) {
   process.new_selector()
   |> process.select_other(Unexpected)
   |> select_exits(self.trapping)
-  |> process.select_map(timer.subject(self.timers), Fired)
+  |> process.select_map(book.subject(self.timers), Fired)
   |> process.merge_selector(self.selector)
   |> sys.selecting(System)
 }
@@ -1585,7 +1633,7 @@ fn handle_system(
       let self = Self(..self, plane:)
 
       case was_suspended, sys.is_suspended(plane) {
-        False, True -> Self(..self, timers: timer.cancel_all(self.timers))
+        False, True -> Self(..self, timers: book.cancel_all(self.timers))
         True, False -> rearm_all(self)
         False, False -> self
         True, True -> self
@@ -1639,12 +1687,12 @@ fn handle_exit(
 /// handled in a state that did not arm it.
 fn handle_fired(
   self: Self(state, data, message),
-  fired: timer.Fired(TimerKey, message),
+  fired: book.Fired(TimerKey, message),
 ) -> ExitReason {
-  case timer.accept(self.timers, fired) {
-    timer.Stale(timers:) -> loop(Self(..self, timers:))
+  case book.accept(self.timers, fired) {
+    book.Stale(timers:) -> loop(Self(..self, timers:))
 
-    timer.Deliver(timers:, key:, message:) -> {
+    book.Deliver(timers:, key:, message:) -> {
       let self = Self(..self, timers:)
 
       case cadence_of(self, key) {
@@ -1866,7 +1914,7 @@ fn arm(
 ) -> Self(state, data, message) {
   Self(
     ..self,
-    timers: timer.set(self.timers, for: key, after: after_ms, sending: message),
+    timers: book.set(self.timers, for: key, after: after_ms, sending: message),
     arming: dict.insert(self.arming, key, Arming(after_ms:, message:, cadence:)),
   )
 }
@@ -1881,7 +1929,7 @@ fn disarm(
 ) -> Self(state, data, message) {
   Self(
     ..self,
-    timers: timer.cancel(self.timers, key),
+    timers: book.cancel(self.timers, key),
     arming: dict.delete(self.arming, key),
   )
 }

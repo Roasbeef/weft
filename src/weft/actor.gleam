@@ -52,6 +52,14 @@
 ////   arriving in the middle of a continue chain takes effect there rather
 ////   than after the chain drains.
 ////
+//// ## Whose clock the timers run on
+////
+//// The loop timeout and the heartbeat are armed on the wall clock unless
+//// `with_timer_source` says otherwise. An actor belonging to a system with
+//// its own notion of time — a simulated run, a test driving a fake timer
+//// wheel by hand — passes that system's `after` in and keeps every rule
+//// above; `weft/timer` has what an injected source is and is not held to.
+////
 //// ## Example
 ////
 //// ```gleam
@@ -97,7 +105,8 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import weft/internal/sys
-import weft/internal/timer
+import weft/internal/timer as book
+import weft/timer.{type Source, WallClock}
 
 // ---------------------------------------------------------------- interop
 
@@ -431,6 +440,8 @@ pub opaque type Builder(state, message, return) {
     /// The heartbeat: a message to handle over and over, at an interval
     /// nothing but the actor's own death interrupts.
     periodic: Option(Periodic(message)),
+    /// Which clock the loop timeout and the heartbeat are armed on.
+    timer_source: Source,
   )
 }
 
@@ -473,6 +484,7 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     hibernate_after: None,
     idle_timeout: None,
     periodic: None,
+    timer_source: WallClock,
   )
 }
 
@@ -514,6 +526,7 @@ pub fn new_with_initialiser(
     hibernate_after: None,
     idle_timeout: None,
     periodic: None,
+    timer_source: WallClock,
   )
 }
 
@@ -788,6 +801,44 @@ pub fn periodic(
   Builder(..builder, periodic: Some(Periodic(every_ms: ms, message:)))
 }
 
+/// Arm the loop timeout and the heartbeat through `source` rather than on
+/// the wall clock.
+///
+/// Both are unaffected in every other respect: the same intervals, the same
+/// reset rules, the same fixed-delay re-arm on the far side of each tick's
+/// handler, and the same disarm-and-re-arm across a suspension. What changes
+/// is who decides that a delay has elapsed.
+///
+/// Reach for this when the actor belongs to a system that owns its own
+/// notion of time — a simulated run stepping a logical clock, a test driving
+/// a fake timer wheel by hand. Such an actor on the wall clock is not merely
+/// awkward to test: it is a second clock in a system built to have one, and
+/// a deterministic run with two clocks is not deterministic.
+///
+/// An injected source cannot be cancelled, only ignored. A wake for a
+/// timeout the actor has since reset still arrives, and is dropped by the
+/// timer book — which is what the generation stamp has always been for.
+/// `weft/timer` carries the full contract, including that a wake may be late
+/// or duplicated, and that a wake never delivered costs liveness for that
+/// one timeout.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // A heartbeat that ticks when the simulation says so, and never
+/// // otherwise.
+/// actor.new(state)
+/// |> actor.with_timer_source(timer.Injected(after: session_after))
+/// |> actor.periodic(every: 10_000, sending: Renew)
+/// // -> one `Renew` per wake the source runs
+/// ```
+pub fn with_timer_source(
+  builder: Builder(state, message, return),
+  source: Source,
+) -> Builder(state, message, return) {
+  Builder(..builder, timer_source: source)
+}
+
 // ------------------------------------------------------------------ start
 
 /// Start an actor from a builder.
@@ -940,7 +991,7 @@ type Self(state, message) {
     beat: Option(Periodic(message)),
     /// The timer book backing the loop timeout and the heartbeat, and the
     /// flush that makes a cancelled timeout safe.
-    timers: timer.Timers(TimerKey, message),
+    timers: book.Timers(TimerKey, message),
     /// Whether the message being handled is a heartbeat tick, and so
     /// whether the next beat is owed once that handler returns.
     beating: Beating,
@@ -986,7 +1037,7 @@ type Event(message) {
 
   /// The loop timeout or the heartbeat fired. It may be stale; the timer
   /// book decides.
-  Tick(fired: timer.Fired(TimerKey, message))
+  Tick(fired: book.Fired(TimerKey, message))
 
   /// A message no selector arm claimed. Discarded with a warning.
   Unexpected(message: Dynamic)
@@ -1053,7 +1104,7 @@ fn initialise_actor(
           hibernate_after: builder.hibernate_after,
           idle: builder.idle_timeout,
           beat: builder.periodic,
-          timers: timer.new(process.new_subject()),
+          timers: book.new_on(process.new_subject(), builder.timer_source),
           beating: Quiet,
         )
 
@@ -1186,7 +1237,7 @@ fn running_selector(self: Self(state, message)) -> Selector(Event(message)) {
   process.new_selector()
   |> process.select_other(Unexpected)
   |> select_exits(self.trapping)
-  |> process.select_map(timer.subject(self.timers), Tick)
+  |> process.select_map(book.subject(self.timers), Tick)
   |> process.merge_selector(self.selector)
   |> sys.selecting(System)
 }
@@ -1253,7 +1304,7 @@ fn handle_system(
       let plane = sys.handle(self.plane, message, holding: self.state)
       let self = Self(..self, plane:)
       case was_suspended, sys.is_suspended(plane) {
-        False, True -> Self(..self, timers: timer.cancel_all(self.timers))
+        False, True -> Self(..self, timers: book.cancel_all(self.timers))
         True, False -> arm_beat(arm_idle(self))
         False, False -> self
         True, True -> self
@@ -1293,18 +1344,18 @@ fn handle_exit(
 /// the programmer's handler.
 fn handle_tick(
   self: Self(state, message),
-  fired: timer.Fired(TimerKey, message),
+  fired: book.Fired(TimerKey, message),
 ) -> ExitReason {
-  case timer.accept(self.timers, fired) {
-    timer.Stale(timers:) -> loop(Self(..self, timers:))
+  case book.accept(self.timers, fired) {
+    book.Stale(timers:) -> loop(Self(..self, timers:))
 
-    timer.Deliver(timers:, key: IdleTimer, message:) ->
+    book.Deliver(timers:, key: IdleTimer, message:) ->
       handle(Self(..self, timers:), message)
 
     // The heartbeat is one-shot in the book like everything else; what makes
     // it periodic is that its key is remembered here and armed again on the
     // far side of the handler, which is what "fixed delay" means.
-    timer.Deliver(timers:, key: BeatTimer, message:) ->
+    book.Deliver(timers:, key: BeatTimer, message:) ->
       handle(Self(..self, timers:, beating: BeatPending), message)
   }
 }
@@ -1342,7 +1393,7 @@ fn arm_idle(self: Self(state, message)) -> Self(state, message) {
     Some(Idle(after_ms:, message:)) ->
       Self(
         ..self,
-        timers: timer.set(
+        timers: book.set(
           self.timers,
           for: IdleTimer,
           after: after_ms,
@@ -1364,7 +1415,7 @@ fn arm_beat(self: Self(state, message)) -> Self(state, message) {
     Some(Periodic(every_ms:, message:)) ->
       Self(
         ..self,
-        timers: timer.set(
+        timers: book.set(
           self.timers,
           for: BeatTimer,
           after: every_ms,
