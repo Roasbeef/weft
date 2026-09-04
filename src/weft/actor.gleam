@@ -106,6 +106,7 @@ import gleam/result
 import gleam/string
 import weft/internal/sys
 import weft/internal/timer as book
+import weft/registry
 import weft/timer.{type Source, WallClock}
 
 // ---------------------------------------------------------------- interop
@@ -423,8 +424,8 @@ pub opaque type Builder(state, message, return) {
     initialisation_timeout: Int,
     /// Called for each message the actor receives.
     on_message: fn(state, message) -> Next(state, message),
-    /// The name to register the actor under, if any.
-    name: Option(process.Name(message)),
+    /// Creates and optionally registers the inbox before initialisation.
+    create_subject: fn() -> Result(Subject(message), String),
     /// Whether the actor traps exits, turning exit signals from linked
     /// processes into messages the loop can act on.
     trap_exits: Bool,
@@ -477,7 +478,7 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     initialise:,
     initialisation_timeout: 1000,
     on_message: fn(state, _message) { continue(state) },
-    name: None,
+    create_subject: fn() { Ok(process.new_subject()) },
     trap_exits: False,
     linkage: Linked,
     on_shutdown: None,
@@ -519,7 +520,7 @@ pub fn new_with_initialiser(
     initialise:,
     initialisation_timeout: timeout,
     on_message: fn(state, _message) { continue(state) },
-    name: None,
+    create_subject: fn() { Ok(process.new_subject()) },
     trap_exits: False,
     linkage: Linked,
     on_shutdown: None,
@@ -566,7 +567,30 @@ pub fn named(
   builder: Builder(state, message, return),
   name: process.Name(message),
 ) -> Builder(state, message, return) {
-  Builder(..builder, name: Some(name))
+  Builder(..builder, create_subject: fn() {
+    use Nil <- result.try(register_self(name))
+    Ok(process.named_subject(name))
+  })
+}
+
+/// Binds the actor to a reclaimable address before its initialiser runs.
+///
+/// A conflicting live binding fails startup. A replacement actor binds the
+/// same address to a fresh inbox after its predecessor exits. Resolve the
+/// address for each send; the subject returned by start names one incarnation.
+/// If combined with `named`, the last builder call selects registration.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let address = registry.new_address(names)
+/// let started = actor.new(0) |> actor.addressed(address) |> actor.start
+/// ```
+pub fn addressed(
+  builder: Builder(state, message, return),
+  address: registry.Address(message),
+) -> Builder(state, message, return) {
+  Builder(..builder, create_subject: fn() { registry.register_self(address) })
 }
 
 /// Whether `start` links the new process to the process that started it.
@@ -1066,13 +1090,7 @@ fn initialise_actor(
   }
 
   let started = {
-    use subject <- result.try(case builder.name {
-      None -> Ok(process.new_subject())
-      Some(name) -> {
-        use _ <- result.try(register_self(name))
-        Ok(process.named_subject(name))
-      }
-    })
+    use subject <- result.try(builder.create_subject())
     use initialised <- result.try(builder.initialise(subject))
     Ok(#(subject, initialised))
   }
