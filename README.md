@@ -134,6 +134,32 @@ down instead of building a backlog of them in the mailbox.
 An enter callback returns `Enter`, not `Next`, so postponing where there is
 no event in hand is a compile error rather than a surprise at runtime.
 
+## weft/registry — reclaimable actor addresses
+
+A long-lived server can give each restartable actor an `Address(message)`
+without allocating a permanent process-name atom. The address stays the
+same across restarts; `lookup` resolves its current subject from an unnamed
+ETS table, and recipient monitors reclaim dead bindings.
+
+```gleam
+import weft/registry
+
+let assert Ok(names) = registry.start()
+let address = registry.new_address(names)
+let assert Ok(started) =
+  actor.new(0)
+  |> actor.addressed(address)
+  |> actor.start
+
+assert registry.lookup(address) == Ok(started.data)
+```
+
+`state_machine.addressed` has the same registration-before-initialisation
+contract. Resolve an address again when sending to a restarted recipient:
+a cached subject still points to its old process. The linked registry owns
+resolution only. Stop recipients and drain their effects before stopping
+the registry; registry shutdown itself does neither.
+
 ## weft/event_manager — a typed gen_event
 
 One process fanning events out to an ordered list of handlers, each carrying
