@@ -28,6 +28,7 @@ import gleam/otp/system
 import gleam/string
 import gleeunit
 import weft/state_machine as sm
+import weft/timer
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -773,6 +774,87 @@ pub fn suspension_freezes_a_periodic_timeout_too_test() -> Nil {
   // And the series was put back rather than dropped.
   process.sleep(900)
   assert list.length(sm.call(started.data, waiting: 1000, sending: Rings)) >= 2
+
+  discard(started.pid)
+}
+
+// ------------------------------------------------- an injected timer source
+
+/// One arming the machine asked its injected timer source for.
+///
+/// The wake is kept rather than run: a machine on this source has no clock
+/// of its own, so every fire in the two tests below is one the test decided
+/// to deliver.
+type Arming {
+  Arming(delay_ms: Int, wake: fn() -> Nil)
+}
+
+/// A clockwork machine whose timeouts are armed through a fake wheel.
+///
+/// The wheel records and fires nothing, which is what makes these tests say
+/// something: on the wall clock — every other timeout test in this file —
+/// the same armings ring on their own after a sleep, and here no sleep is
+/// long enough.
+fn start_clockwork_on(
+  armings: Subject(Arming),
+) -> sm.Started(Subject(Clockwork)) {
+  let source =
+    timer.Injected(after: fn(delay_ms, wake) {
+      process.send(armings, Arming(delay_ms:, wake:))
+    })
+
+  let assert Ok(started) =
+    sm.new(Alpha, [])
+    |> sm.on_event(clockwork_handler)
+    |> sm.with_timer_source(source)
+    |> sm.start
+    as "the machine must start"
+  started
+}
+
+pub fn an_injected_named_timeout_rings_only_when_woken_test() -> Nil {
+  let armings = process.new_subject()
+  let started = start_clockwork_on(armings)
+
+  sm.send(started.data, NamedTimeoutIn("dinner", 40))
+
+  let assert Ok(arming) = process.receive(armings, 500)
+    as "the machine armed its named timeout through the injected source"
+  assert arming.delay_ms == 40
+
+  // The control is `a_named_timeout_survives_transitions_test` and every
+  // other timeout test above: the same arming on the wall clock rings after
+  // a sleep of this length. Here the wall clock buys nothing at all.
+  process.sleep(200)
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
+
+  arming.wake()
+
+  // The wake was sent before the call, from this process, so the fire is
+  // ahead of the call in the machine's mailbox and is certainly handled
+  // first. Nothing here is waiting on a race.
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == ["dinner"]
+
+  discard(started.pid)
+}
+
+pub fn a_cancelled_injected_named_timeout_is_flushed_by_the_loop_test() -> Nil {
+  // The same machine as above with one line added, which is what makes the
+  // pair worth anything. The added line is the cancel — and under an
+  // injected source a cancel stops nothing, so this is the only thing
+  // standing between a cancelled timeout and the event handler.
+  let armings = process.new_subject()
+  let started = start_clockwork_on(armings)
+
+  sm.send(started.data, NamedTimeoutIn("dinner", 40))
+
+  let assert Ok(arming) = process.receive(armings, 500)
+    as "the machine armed its named timeout through the injected source"
+
+  sm.send(started.data, CancelNamed("dinner"))
+  arming.wake()
+
+  assert sm.call(started.data, waiting: 1000, sending: Rings) == []
 
   discard(started.pid)
 }

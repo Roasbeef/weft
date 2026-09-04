@@ -19,6 +19,7 @@ import gleam/result
 import gleam/string
 import gleeunit
 import weft/actor
+import weft/timer
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -612,6 +613,66 @@ pub fn suspension_freezes_the_heartbeat_too_test() -> Nil {
   // And the series was put back rather than dropped.
   process.sleep(900)
   assert actor.call(started.data, waiting: 1000, sending: Count) >= 2
+
+  discard(started.pid)
+}
+
+// ------------------------------------------------- an injected timer source
+
+/// One arming the actor asked its injected timer source for.
+///
+/// The wake is kept rather than run: an actor on this source has no clock of
+/// its own, so every beat below is one the test decided to deliver.
+type Arming {
+  Arming(delay_ms: Int, wake: fn() -> Nil)
+}
+
+pub fn an_injected_heartbeat_beats_once_per_wake_test() -> Nil {
+  // The control is `the_heartbeat_beats_over_and_over_test`, which is this
+  // actor on the wall clock and counts three beats in 250ms. Here the wall
+  // clock buys nothing: only a wake the test runs moves the count.
+  let armings = process.new_subject()
+  let source =
+    timer.Injected(after: fn(delay_ms, wake) {
+      process.send(armings, Arming(delay_ms:, wake:))
+    })
+
+  let assert Ok(started) =
+    actor.new(0)
+    |> actor.with_timer_source(source)
+    |> actor.periodic(every: 30, sending: Bump)
+    |> actor.on_message(counter_handler)
+    |> actor.start
+    as "the actor must start"
+
+  let assert Ok(first) = process.receive(armings, 500)
+    as "the heartbeat is armed once at start, through the source"
+  assert first.delay_ms == 30
+
+  process.sleep(150)
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 0
+
+  // Fixed delay: the next arming is asked for on the far side of a tick's
+  // own handler, so until one has ticked there is nothing further recorded —
+  // not the traffic of the call above, and not the passage of time.
+  assert process.receive(armings, 20) == Error(Nil)
+
+  first.wake()
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 1
+
+  // One tick, one re-arm, and it went through the source rather than around
+  // it: an actor that armed its next beat on the wall clock would beat on
+  // without ever being woken again.
+  let assert Ok(second) = process.receive(armings, 500)
+    as "the tick's handler returned, so the next beat is armed"
+  assert second.delay_ms == 30
+
+  second.wake()
+  assert actor.call(started.data, waiting: 1000, sending: Count) == 2
+
+  let assert Ok(third) = process.receive(armings, 500)
+    as "the second tick re-armed too"
+  assert third.delay_ms == 30
 
   discard(started.pid)
 }

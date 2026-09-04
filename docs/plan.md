@@ -1,8 +1,9 @@
 # Plan of record
 
-Rewritten at the close of the initial build-out (2026-08-31). All four
-public modules are on `main`, every gate green: 96 tests, lint 0 errors and
-0 warnings, doc graph clean.
+Rewritten at the close of the initial build-out (2026-08-31), and amended
+as each phase landed. Six public modules are on `main` — the run engine,
+`actor`, `state_machine`, `event_manager`, `poll` and `timer` — every gate
+green: 163 tests, lint 0 errors, doc graph clean.
 
 ## What landed
 
@@ -17,6 +18,7 @@ public modules are on `main`, every gate green: 96 tests, lint 0 errors and
 | `weft` dynamic adoption | loom#159 phase 2 | `0.3.0`, `0.3.1` | `managed`/`Ledger`/`adopt`/`adopt_leaf`, `start_witnessed` (a `Witnessed` handle since 0.3.1), `cancel_when_exits`; many owners per task |
 | Periodic timeouts | loom#159 phase 3 | `0.4.1` | `sm.with_periodic_timeout` and `actor.periodic`; fixed delay, re-armed after the handler |
 | Injected clocks for `weft/poll` | loom#159 phase 3 | `0.4.1` | `Clock`/`monotonic`, `until_on`, `fold_until`, `Interval` |
+| Injected timer source | loom#165 | `0.4.2` | `weft/timer`'s `Source`; `with_timer_source` on the machine and the actor |
 
 `src/weft/CLAUDE.md` carries the module graph, the message traffic, and
 the invariants; the closed issues carry the deviations from their own
@@ -155,6 +157,50 @@ came back for, and it settled these:
   frozen clock, but it would then be measuring two different times at once
   and reporting neither.
 
+## Rulings made for the injected timer source (0.4.2)
+
+- **A two-variant `Source`, not a closure on its own.** A book that took
+  only `fn(delay_ms, wake) -> Nil` would have to arm the wall clock through
+  that shape too, and the wall clock's arming call returns something the
+  book uses: `process.send_after` yields a handle, and `cancel` stops the
+  superseded timer with it. Flattening both into one closure would either
+  throw that handle away — making every weft loop pay the injected source's
+  uncancellability, on the default path, forever — or push a handle type
+  into the closure's return and make a fake wheel implement it. `WallClock`
+  and `Injected` are the two arming stories weft actually has, and the
+  book's `set` is the one place that tells them apart.
+- **The injected shape mirrors the consumer's own seam exactly.** The
+  consumer that asked for this holds its time capability as
+  `fn(Int, fn() -> Nil) -> Nil` — one call, no handle, no result — and
+  passes it straight in. A shape of weft's own devising, however slightly
+  better, would be an adapter at every call site and a second place for the
+  contract to drift. It is also the weakest shape that can work, which is
+  what lets a fake wheel in a test be a legal source.
+- **Cancel is best effort under injection, and that is sound rather than
+  tolerated.** The book has always had to recognise a fire it could not
+  stop: `erlang:cancel_timer` cannot recall a message already in the
+  mailbox, so `accept` compares generations and drops the stale one. An
+  injected arming is that window widened to always. Nothing new defends it
+  because nothing new is needed — and the corollary is that the generation
+  check is now load-bearing rather than belt-and-braces, which is why the
+  new tests run a cancelled arming's wake on purpose rather than racing it.
+- **The source is fixed at construction, not passed per timer.** It is a
+  property of the loop: a machine arming half its timeouts on a logical
+  clock and half on the wall clock has no coherent notion of when anything
+  happens, and no consumer has asked for one. `new_on` takes it once, the
+  builders store it, and every rule already written about the four timeout
+  kinds — reset, cancel, flush, the periodic re-arm after the handler,
+  disarm-on-suspend and re-arm-from-full on resume — holds unchanged on
+  either source because all of them go through `set`.
+- **What was cut.** No `Clock(now, sleep)` source: the book needs `after`
+  and nothing else, and it never reads a clock or rests. No change to
+  `weft/poll`, whose injected `Clock` answers a different question (a
+  foreground wait in the caller's own process) and is not the same value.
+  No source on the run engine's `deadline`, which no consumer has asked
+  for. And no way to ask a book which source it is on: a loop knows, and a
+  consumer that reads it is about to write a branch that should have been
+  two configurations.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both
@@ -199,6 +245,12 @@ on the machine (`with_periodic_timeout`) and the actor (`actor.periodic`),
 and the injected clock for `weft/poll` (`Clock`, `monotonic`, `until_on`,
 `fold_until`, `Interval`). Both are additive — no existing signature,
 variant or behaviour moves, and `until` still means exactly what it meant.
+`0.4.2` adds the injected timer source: the public `weft/timer` module
+with `Source`, `new_on` inside the book, and `with_timer_source` on the
+actor and machine builders. Additive again — a builder that says nothing
+gets `WallClock`, which is what `new` has always armed — and cut once
+loom's schedule-scan consumer had a named timeout it could drive on its own
+time base rather than a hand-rolled generation-stamped tick of its own.
 `gleam publish` from the root builds, uploads, and pushes hexdocs in one
 step (needs a hex account and API key). `1.0.0` is the API freeze and
 should wait for the deferred engine follow-ups to settle the `weft`

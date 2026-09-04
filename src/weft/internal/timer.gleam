@@ -31,9 +31,21 @@
 //// recording the new generation, and delete the entry *before* handing the
 //// message on, so a duplicate fire for the same generation cannot be
 //// delivered twice.
+////
+//// Which clock the arming rides is the book's one configurable decision
+//// (`weft/timer`'s `Source`, taken at `new_on`), and it is deliberately
+//// confined to `set`: a book on an injected source stamps, flushes and
+//// accounts for its timers exactly as a wall-clock one does. The one thing
+//// it cannot do is stop an arming — an injected `after` returns no handle —
+//// which is why stale-by-generation is load-bearing rather than a
+//// belt-and-braces second line. A book that recognised a stale fire only
+//// *sometimes* would be unsound under injection; this one recognises every
+//// one of them, so the missing cancel costs a wasted message and nothing
+//// more.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
+import weft/timer.{type Source, Injected, WallClock}
 
 /// A timer message as it lands in the owner's mailbox.
 ///
@@ -52,10 +64,26 @@ pub type Fired(key, message) {
   )
 }
 
-/// One live timer: the handle needed to cancel it, and the stamp its
-/// message carries.
+/// One live timer: whatever the source gave back to cancel it with, and the
+/// stamp its message carries.
 type Entry {
-  Entry(timer: process.Timer, generation: Int)
+  Entry(handle: Handle, generation: Int)
+}
+
+/// What `cancel` can still do about one arming.
+///
+/// A two-variant type rather than an `Option(process.Timer)` because the
+/// question a reader of `stop` is asking is not "is there a timer" but "can
+/// this arming be recalled at all", and the answer is a property of the
+/// source that armed it.
+type Handle {
+  /// A wall-clock arming, stoppable by its own BEAM timer handle until the
+  /// moment it fires.
+  Cancellable(timer: process.Timer)
+
+  /// An injected arming. The wake is in the source's hands and no longer in
+  /// the book's, so nothing can stop it and `accept` is where it dies.
+  Uncancellable
 }
 
 /// The set of timers a single receive loop owns.
@@ -63,10 +91,12 @@ type Entry {
 /// It is a plain value threaded through the loop's state, so a loop that
 /// forgets to keep the returned book loses the ability to recognise stale
 /// fires — the type is opaque so that the generation counter can never be
-/// rewound by a caller.
+/// rewound by a caller, and so that the source cannot be swapped under a
+/// set of timers already armed on the other one.
 pub opaque type Timers(key, message) {
   Timers(
     subject: Subject(Fired(key, message)),
+    source: Source,
     entries: Dict(key, Entry),
     next_generation: Int,
   )
@@ -85,7 +115,7 @@ pub type Delivery(key, message) {
   Stale(timers: Timers(key, message))
 }
 
-/// Create an empty timer book delivering to `subject`.
+/// Create an empty timer book on the wall clock, delivering to `subject`.
 ///
 /// The subject is an argument rather than something created here because
 /// its owner must be the process that runs the receive loop: a book created
@@ -97,10 +127,38 @@ pub type Delivery(key, message) {
 ///
 /// ```gleam
 /// let timers = timer.new(process.new_subject())
-/// // -> an empty book, nothing armed
+/// // -> an empty book on the wall clock, nothing armed
 /// ```
 pub fn new(subject: Subject(Fired(key, message))) -> Timers(key, message) {
-  Timers(subject:, entries: dict.new(), next_generation: 0)
+  new_on(subject, WallClock)
+}
+
+/// Create an empty timer book arming through `source`.
+///
+/// The source is fixed at construction rather than passed to each `set`,
+/// because it is a property of the loop and not of one timeout: a loop
+/// arming half its timers on a simulated clock and half on the wall clock
+/// would have no coherent notion of when anything happens, and no consumer
+/// has asked for one. Fixing it here also means every later call in this
+/// module can be read without asking which clock it is on.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let timers = timer.new_on(process.new_subject(), timer.WallClock)
+/// // -> exactly what `timer.new(process.new_subject())` builds
+/// ```
+///
+/// ```gleam
+/// let timers =
+///   timer.new_on(process.new_subject(), timer.Injected(after: wheel_after))
+/// // -> an empty book whose timers fire when the wheel says so
+/// ```
+pub fn new_on(
+  subject: Subject(Fired(key, message)),
+  source: Source,
+) -> Timers(key, message) {
+  Timers(subject:, source:, entries: dict.new(), next_generation: 0)
 }
 
 /// The subject timers fire into.
@@ -124,7 +182,9 @@ pub fn subject(timers: Timers(key, message)) -> Subject(Fired(key, message)) {
 /// so `set` cancels first and stamps a fresh generation second. The order
 /// matters: the new generation is what makes the cancelled timer's message
 /// recognisable if it was already in flight, so the stamp must be taken
-/// after the old entry is gone and never reused.
+/// after the old entry is gone and never reused. On an injected source the
+/// cancel stops nothing at all, so that stamp is the only thing keeping the
+/// replaced arming's wake out of the consumer's handler.
 ///
 /// ## Examples
 ///
@@ -140,19 +200,48 @@ pub fn set(
 ) -> Timers(key, message) {
   let timers = cancel(timers, key)
   let generation = timers.next_generation
-  let timer =
-    process.send_after(timers.subject, ms, Fired(key:, generation:, message:))
-  let entries = dict.insert(timers.entries, key, Entry(timer:, generation:))
+
+  // The one call in the book that knows which clock it is on. Everything
+  // after it — the stamp, the entry, the flush in `accept` — is written once
+  // for both sources, which is what makes an injected source a
+  // configuration choice rather than a second implementation.
+  let handle = arm(timers, ms, Fired(key:, generation:, message:))
+
+  let entries = dict.insert(timers.entries, key, Entry(handle:, generation:))
   Timers(..timers, entries:, next_generation: generation + 1)
+}
+
+/// Ask the book's source to deliver `fired` after `ms`, and report what can
+/// be done about it afterwards.
+///
+/// The injected branch performs the send inside the wake rather than here:
+/// the wake runs in whatever process the source chooses at whatever moment
+/// it chooses, and the arming call itself must not wait for either.
+fn arm(
+  timers: Timers(key, message),
+  ms: Int,
+  fired: Fired(key, message),
+) -> Handle {
+  case timers.source {
+    WallClock -> Cancellable(process.send_after(timers.subject, ms, fired))
+
+    Injected(after:) -> {
+      after(ms, fn() { process.send(timers.subject, fired) })
+      Uncancellable
+    }
+  }
 }
 
 /// Cancel the timer armed under `key`, if there is one.
 ///
-/// This stops a timer that has not fired yet. A timer that fired in the
-/// window before this call has already put its message in the mailbox and
-/// cannot be recalled; dropping the entry here is what makes `accept`
-/// classify that message as `Stale`. Cancelling an unarmed key is a no-op,
-/// which is what lets a loop cancel unconditionally on a state change.
+/// On the wall clock this stops a timer that has not fired yet. A timer that
+/// fired in the window before this call has already put its message in the
+/// mailbox and cannot be recalled; dropping the entry here is what makes
+/// `accept` classify that message as `Stale`. On an injected source *every*
+/// cancel is that window — there is no handle to stop the wake with — so
+/// dropping the entry is the entire operation. Cancelling an unarmed key is
+/// a no-op either way, which is what lets a loop cancel unconditionally on
+/// a state change.
 ///
 /// ## Examples
 ///
@@ -168,20 +257,40 @@ pub fn cancel(
     Error(Nil) -> timers
 
     Ok(entry) -> {
-      // The result is deliberately unexamined. `Cancelled` means the message
-      // will never arrive and `TimerNotFound` means it may already be in the
-      // mailbox, but the book cannot act differently on the two: the entry
-      // has to go either way, and its absence is precisely the signal
-      // `accept` uses to discard a fire that beat the cancel.
-      let _ = process.cancel_timer(entry.timer)
+      stop(entry.handle)
       Timers(..timers, entries: dict.delete(timers.entries, key))
     }
   }
 }
 
+/// Stop whatever can be stopped about one arming.
+///
+/// Neither branch can report anything the caller could act on, which is the
+/// point: the entry has to go either way, and its absence is precisely the
+/// signal `accept` uses to discard a fire the cancel did not beat.
+fn stop(handle: Handle) -> Nil {
+  case handle {
+    // The result is deliberately unexamined. `Cancelled` means the message
+    // will never arrive and `TimerNotFound` means it may already be in the
+    // mailbox, but the book cannot act differently on the two.
+    Cancellable(timer:) -> {
+      let _ = process.cancel_timer(timer)
+      Nil
+    }
+
+    // Nothing to stop: an injected arming was handed out as a closure and
+    // no handle came back, so this wake will arrive and `accept` will drop
+    // it. Under this source that is the whole of cancellation.
+    Uncancellable -> Nil
+  }
+}
+
 /// Cancel every armed timer.
 ///
-/// Used when a loop leaves the state that armed them, or shuts down.
+/// Used when a loop leaves the state that armed them, or shuts down — and
+/// by a suspension, which disarms everything and re-arms from the loop's
+/// own arming records on resume. Each key goes through `cancel`, so the
+/// wall-clock and injected halves of that are the same code.
 ///
 /// ## Examples
 ///
@@ -216,6 +325,10 @@ pub fn is_set(timers: Timers(key, message), key: key) -> Bool {
 /// these are one-shot timers and a second fire under the same generation —
 /// however it arose — must not reach the consumer twice.
 ///
+/// Under an injected source this is not the second line of defence but the
+/// only one: nothing stopped the superseded arming, so every wake the
+/// source ever makes arrives here and is classified.
+///
 /// ## Examples
 ///
 /// ```gleam
@@ -233,7 +346,7 @@ pub fn accept(
     // fire for a generation already delivered.
     Error(Nil) -> Stale(timers)
 
-    Ok(Entry(generation:, timer: _)) if generation == fired.generation ->
+    Ok(Entry(generation:, handle: _)) if generation == fired.generation ->
       Deliver(
         timers: Timers(
           ..timers,
@@ -245,6 +358,6 @@ pub fn accept(
 
     // The key is armed, but under a later generation: this message belongs
     // to an arming that was replaced while it was in flight.
-    Ok(Entry(generation: _, timer: _)) -> Stale(timers)
+    Ok(Entry(generation: _, handle: _)) -> Stale(timers)
   }
 }
