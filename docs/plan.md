@@ -201,6 +201,46 @@ came back for, and it settled these:
   consumer that reads it is about to write a branch that should have been
   two configurations.
 
+## Reclaimable addresses (single-daemon consumer)
+
+Loom's shared daemon must open and close sessions without accumulating
+permanent process-name atoms. `weft/registry` provides a typed reference
+address whose current subject can change after a recipient exits. One
+linked OTP owner holds an unnamed ETS table; readers resolve directly,
+while registration and monitor cleanup run through that owner. The table
+contains only bound addresses, not every address ever allocated.
+
+The actor and state-machine builders gain `addressed`, alongside `named`.
+Both configure one subject factory, so only the last setter applies.
+Registration precedes custom initialisation and startup acknowledgement.
+A failed initialiser exits and its monitor releases the binding. A caller
+may also register a local unnamed subject explicitly, including one owned
+by a child process.
+
+The important boundary is ownership: the registry owns address resolution,
+not recipient lifetime or effect drain. Replacing a dead binding is safe
+for routing, but does not authorize restarting external work whose drain
+has not been proved. Its caller must retain the namespace until all users
+that need it have drained. Stopping the registry invalidates its addresses
+without killing recipients. No unregister, distributed registration, or
+application-message forwarding is needed by this consumer.
+
+Each binding has a fresh monitor. An old DOWN cannot erase a replacement,
+and repeated registration of the same subject adds neither rows nor
+monitors. A lookup rejects a dead recipient even before cleanup runs. Tests
+exercise replacement, stale DOWN replay, duplicate/conflicting bindings,
+startup ordering and failure, namespace shutdown, and warmed lifecycle
+cycles with no atom growth. A suspended-owner test checks that registration
+timeouts release the surviving caller's monitor. The local suite contains
+176 tests; this addition is not yet published.
+
+The new dependency edges are `actor`/`state_machine` → `registry` →
+`internal/registry`. The owner uses the existing `gleam/otp/actor` binding,
+not a new receive loop. Registration policy and monitor cleanup stay in
+Gleam; Erlang supplies only the missing ETS operations and local-subject
+validation. Using the upstream actor here avoids a cycle through `weft/actor`'s
+addressed builder without adding another public module.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both

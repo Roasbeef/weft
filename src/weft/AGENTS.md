@@ -1,6 +1,6 @@
 # src/weft — the module graph
 
-Five public modules here plus two internal ones. The parent directory's
+Six public modules here plus three internal ones. The parent directory's
 `weft.gleam` (the run engine) is documented here too, since the graph only
 makes sense whole.
 
@@ -34,6 +34,13 @@ makes sense whole.
   the default is the wall clock. Reuses `gleam_otp`'s `Started`/`StartError`/
   `ChildSpecification` for interop — a weft actor slots into an upstream
   supervisor unchanged.
+- **`weft/registry`** — reclaimable `Address(message)` values backed by
+  references. A linked OTP owner serializes bindings into an unnamed ETS
+  table and monitors recipients; lookups read the table directly. The
+  registry owns resolution, not recipient shutdown or external-effect drain.
+  `actor.addressed` and `state_machine.addressed` register before custom
+  initialisation and the startup acknowledgement. Their existing `named`
+  alternative remains available; the last naming setter wins.
 - **`weft/state_machine`** — typed gen_statem. Its own loop (a sibling of
   the actor's, not a wrapper): postpone replay, the four-timeout
   discipline, enter callbacks. Consumes both internals directly. The
@@ -83,11 +90,19 @@ makes sense whole.
   `Uncancellable` accordingly. Under `Injected` nothing can stop a
   superseded arming, so the generation check is the whole defence rather
   than a second line.
+- **`weft/internal/registry`** — the registry's typed Gleam actor handlers,
+  built on `gleam/otp/actor` to avoid a cycle through `weft/actor`'s
+  addressed builder. `src/weft_registry_ffi.erl` contains only ETS operations
+  and local-subject validation. Registration uses a Gleam reply selector
+  whose monitor is released on success, timeout and registry death.
+  Each row holds a reference key, recipient pid, subject and monitor; the
+  monitor map tracks cleanup custody. A dead
+  binding can be replaced before its DOWN arrives without deleting the
+  replacement when that old monitor is delivered.
 - **`weft/internal/sys`** + `src/weft_sys_ffi.erl` — the system-message
   plane (`{system, From, Request}` selection, get_state/get_status/
   suspend/resume replies, observer status shape), `hibernate`, `warn`. All
-  of the library's `@external` lives here and in the engine's one
-  `system_info` call.
+  system-plane FFI lives here; registry FFI has its own internal boundary.
 
 ## Message traffic, concretely
 
@@ -111,6 +126,11 @@ makes sense whole.
   either kind. The actor's `TimerKey` covers `IdleTimer` and `BeatTimer`.
 - Event manager: opaque `Message(event)` — `Notify`/`SyncNotify`/
   `AddHandler`/`CountHandlers` — carried by a plain weft actor.
+- Registry: builders and explicit callers send synchronous
+  `Bind(key, recipient, subject, reply)` requests to its owner. Recipient
+  monitors deliver `Departed(Down)` there; `Stop` ends the actor. Application
+  messages go directly to the resolved subject, never through the registry
+  mailbox.
 
 ## Invariants that break things when violated
 
@@ -161,17 +181,25 @@ makes sense whole.
    FFI stays inside it; the exceptions are the engine's
    `erlang:system_info(schedulers_online)` and `erlang:exit/1` externals,
    both stock BIFs argued in place.
+12. **A registry DOWN removes only its monitor's binding.** Matching a key
+    alone can erase a replacement. Reference keys and unnamed tables create
+    no permanent atoms; recipient death reclaims both the row and monitor.
+13. **An address is stable; a resolved subject is not.** Resolve again for
+    each use that must follow restarts. Registry shutdown invalidates the
+    namespace but neither stops recipients nor proves their effects drained.
 
 ## Dependency edges (enforced by review, not tooling)
 
 ```
 weft ──────────────► gleam_erlang/process, internal/sys
-weft/actor ────────► internal/{sys,timer}, weft/timer, gleam_otp (types)
-weft/state_machine ► internal/{sys,timer}, weft/timer, gleam_otp (types)
+weft/actor ────────► internal/{sys,timer}, weft/{timer,registry}, gleam_otp (types)
+weft/state_machine ► internal/{sys,timer}, weft/{timer,registry}, gleam_otp (types)
 weft/event_manager ► weft/actor, internal/sys (warn ONLY)
 weft/poll ─────────► gleam_erlang/process (sleep only)
 weft/timer ────────► nothing
+weft/registry ─────► internal/registry, gleam_erlang/{process,reference}
 internal/timer ────► gleam_erlang/process, weft/timer
+internal/registry ─► gleam_otp/actor, gleam_erlang/process, weft_registry_ffi (ETS)
 ```
 
 The internal book depending on a *public* module is the one inversion in
