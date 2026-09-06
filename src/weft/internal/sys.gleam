@@ -1,6 +1,10 @@
 //// The OTP plumbing every weft receive loop shares: the system-message
 //// plane, hibernation, and the one logging edge.
 ////
+//// Terminal abnormal exits also pass through this boundary. The one-argument
+//// exit BIF terminates the caller even when it traps exits; sending an exit
+//// signal to itself would only enqueue a message and lose the terminal reason.
+////
 //// A process that wants to be visible to `sys:get_state/1`, `observer` and
 //// a supervisor's shutdown is not free to just receive its own messages. It
 //// has to recognise `{system, From, Request}` in its mailbox, answer on the
@@ -38,6 +42,20 @@ import gleam/otp/system.{
   type Mode, type SystemMessage, GetState, GetStatus, Resume, Running,
   StatusInfo, Suspend, Suspended,
 }
+
+/// Terminate the caller with the exact abnormal reason supplied by its loop.
+///
+/// This never returns. Unlike exit/2, exit/1 raises an exit in the caller
+/// rather than sending a trappable signal to a destination process.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // sys.exit_abnormal(reason)
+/// // The caller's existing monitors receive reason, not normal.
+/// ```
+@external(erlang, "erlang", "exit")
+pub fn exit_abnormal(reason: Dynamic) -> Nil
 
 /// Something that arrived on the `system` tag.
 ///
