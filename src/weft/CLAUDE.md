@@ -103,6 +103,8 @@ makes sense whole.
   plane (`{system, From, Request}` selection, get_state/get_status/
   suspend/resume replies, observer status shape), `hibernate`, `warn`. All
   system-plane FFI lives here; registry FFI has its own internal boundary.
+  The stock exit/1 binding also lives here: actor and state-machine terminal
+  abnormal exits must terminate the caller even when it traps exits.
 
 ## Message traffic, concretely
 
@@ -187,6 +189,10 @@ makes sense whole.
 13. **An address is stable; a resolved subject is not.** Resolve again for
     each use that must follow restarts. Registry shutdown invalidates the
     namespace but neither stops recipients nor proves their effects drained.
+14. **Terminal abnormal exits use exit/1, not a signal to self.** A trapping
+    loop would queue exit/2 as an EXIT message and then return normally.
+    Actor and machine stops, including forwarded linked failures, preserve the
+    exact reason in the original monitor's DOWN.
 
 ## Dependency edges (enforced by review, not tooling)
 

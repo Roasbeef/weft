@@ -241,6 +241,22 @@ Gleam; Erlang supplies only the missing ETS operations and local-subject
 validation. Using the upstream actor here avoids a cycle through `weft/actor`'s
 addressed builder without adding another public module.
 
+## Terminal exits while trapping (single-daemon consumer)
+
+Actor and state-machine abnormal stops terminate through the stock
+`erlang:exit/1` binding in `internal/sys`. Their previous self-directed
+`exit/2` calls became mailbox messages when trapping was enabled. Returning
+from the loop then reported `normal` to monitors, losing the failure that a
+supervisor or drain observer needed to distinguish from clean retirement.
+
+The same terminal helpers forward linked-process failures, so those paths
+use the binding too. Normal return and untrappable kill keep their existing
+behavior. The run engine already uses exit/1 and needs no change. Six
+regressions install their monitors before triggering termination: direct
+normal and abnormal stops on both loops, plus forwarding an exact tuple
+reason from a linked process on each loop. No public API or helper Erlang
+module is added.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both

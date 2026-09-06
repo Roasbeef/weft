@@ -1,6 +1,10 @@
 //// A typed `gen_statem`: a state ADT, a data value, postponed events, and
 //// the four timeout kinds, on a receive loop weft owns.
 ////
+//// Terminal abnormal stops raise exit/1 through internal/sys. A trapping
+//// machine must terminate with that reason, not queue it as a self-directed
+//// EXIT and then return normally. Linked failures use the same terminal path.
+////
 //// ## Why Gleam ships half of gen_statem's surface
 ////
 //// Erlang's `gen_statem` has two callback modes. `state_functions`
@@ -1955,12 +1959,13 @@ fn disarm(
 /// Exit the process with a reason.
 ///
 /// `Normal` needs no signal — returning from the loop is enough — but an
-/// abnormal reason has to be signalled so that it propagates along links,
-/// and a kill has to be a kill.
+/// abnormal reason must terminate the caller through exit/1. Sending it to
+/// self with exit/2 only enqueues an EXIT when this machine traps exits, after
+/// which returning would incorrectly publish Normal to links and monitors.
 fn exit_process(reason: ExitReason) -> ExitReason {
   case reason {
     Normal -> Nil
-    Abnormal(reason:) -> process.send_abnormal_exit(process.self(), reason)
+    Abnormal(reason:) -> sys.exit_abnormal(reason)
     Killed -> process.kill(process.self())
   }
   reason
