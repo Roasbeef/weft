@@ -889,3 +889,91 @@ pub fn adopting_under_an_exited_parent_is_refused_and_asked_test() -> Nil {
   assert weft.pull(detached, within: 5000) == PulledOutcome(Abandoned(index: 0))
   assert weft.pull(detached, within: 5000) == AllDelivered
 }
+
+// --- The adoption barrier -----------------------------------------------------
+
+/// Spawn an owner that exits normally the moment it is told to begin, and
+/// a relay that carries the begin permit to it. The relay is the point:
+/// the permit reaches the owner from a process other than the scope, so
+/// nothing but weft's own barrier orders the scope's monitor ahead of it.
+fn racing_owner() -> #(Pid, Subject(OwnerCommand)) {
+  let #(owner, commands) = obedient_owner()
+  let handoff = process.new_subject()
+
+  process.spawn_unlinked(fn() {
+    let relay = process.new_subject()
+    process.send(handoff, relay)
+
+    let DrainCleanly = process.receive_forever(relay)
+    process.send(commands, DrainCleanly)
+  })
+
+  let assert Ok(relay) = process.receive(handoff, 2000)
+    as "a freshly spawned relay hands its subject over immediately"
+  #(owner, relay)
+}
+
+/// One adoption whose owner finishes as soon as custody crosses.
+fn adopt_then_finish_at_once() -> weft.Outcome(Int, Nil) {
+  let #(owner, relay) = racing_owner()
+
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        case weft.adopt(ledger, owner:, cancel: deaf_cancel()) {
+          weft.Adopted -> {
+            process.send(relay, DrainCleanly)
+            Ok(1)
+          }
+          weft.Refused -> Error(Nil)
+        }
+      }),
+    ])
+    |> weft.start_detached
+
+  let assert PulledOutcome(outcome) = weft.pull(detached, within: 5000)
+    as "the single task settles within the test budget"
+
+  // Drained to the end so the scope exits here rather than lingering for
+  // the rest of the suite.
+  assert weft.pull(detached, within: 5000) == AllDelivered
+  outcome
+}
+
+pub fn an_owner_that_exits_right_after_adoption_still_proves_drained_test() -> Nil {
+  // `adopt` returns once the scope's monitor on the owner is in place, so
+  // an owner started by some other process, which exits normally the
+  // instant it begins, has proved its subtree drained. The permit travels
+  // scope → worker → relay → owner while the monitor travels scope →
+  // owner, and the BEAM orders signals only per sender and receiver pair:
+  // without the barrier the permit can win, and the scope reads the
+  // owner's clean exit as a `noproc` lost proof.
+  //
+  // The window is narrow and opens mostly when the OS deschedules a
+  // scheduler thread, so a clean run here pins the contract rather than
+  // proving the barrier; the before-and-after measurement under load is
+  // recorded on the change that added it. Many runs go at once so that a
+  // loaded CI host has a real chance of finding a regression.
+  let waiters =
+    list.repeat(Nil, 64)
+    |> list.map(fn(_) {
+      let done = process.new_subject()
+      process.spawn(fn() {
+        let lost =
+          list.repeat(Nil, 200)
+          |> list.count(fn(_) {
+            adopt_then_finish_at_once() != Completed(index: 0, value: 1)
+          })
+        process.send(done, lost)
+      })
+      done
+    })
+
+  let lost =
+    list.fold(waiters, 0, fn(sum, done) {
+      let assert Ok(lost) = process.receive(done, 60_000)
+        as "every racing batch finishes within the test budget"
+      sum + lost
+    })
+  assert lost == 0
+}
