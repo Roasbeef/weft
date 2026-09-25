@@ -1,10 +1,11 @@
 %% weft_sys_ffi — the Erlang side of weft/internal/sys.
 %%
-%% Three things live here, all of them shapes Gleam cannot express: the
+%% Four things live here, all of them shapes Gleam cannot express: the
 %% normalisation of an OTP `system` message into a Gleam variant, the reply
-%% protocol `sys` expects (including the alias tagging OTP 24+ uses), and
+%% protocol `sys` expects (including the alias tagging OTP 24+ uses),
 %% `erlang:hibernate/3`, which never returns and so has no Gleam signature
-%% that could be honest about it.
+%% that could be honest about it, and the signal-delivery barrier, which
+%% no binding in gleam_erlang provides.
 %%
 %% Everything here is total by construction. `convert_system_message/1`
 %% answers for any term at all rather than raising a function clause, which
@@ -12,7 +13,7 @@
 %% is reported to the loop instead of killing it.
 -module(weft_sys_ffi).
 
--export([convert_system_message/1, identity/1, hibernate/1]).
+-export([convert_system_message/1, identity/1, hibernate/1, deliver_signals/1]).
 
 identity(X) -> X.
 
@@ -85,3 +86,23 @@ process_status({status_info, Module, Parent, Mode, DebugState, State}) ->
 %% so anything the caller meant to do after it will not happen.
 hibernate(Continue) ->
     erlang:hibernate(erlang, apply, [Continue, []]).
+
+%% Return once every signal this process sent Pid beforehand -- a monitor
+%% above all -- has reached Pid, answering whether Pid was alive then.
+%%
+%% `process_info/2` on a local process is itself a signal from the caller,
+%% so it is ordered behind everything the caller sent before it, and its
+%% answer cannot come back until they have all been delivered. That is the
+%% barrier. `erlang:is_process_alive/1` documents the same guarantee but
+%% does not provide it on OTP 29: measured under load, a monitor taken out
+%% just before it can still be overtaken by a message relayed to Pid
+%% through a third process, and `process_info/2` closes that window where
+%% `is_process_alive/1` does not.
+%%
+%% A pid on another node has no local `process_info/2` and would raise;
+%% signals between nodes are ordered per connection, not by this call, so
+%% a remote pid is reported alive and its monitor answers for the rest.
+deliver_signals(Pid) when node(Pid) =:= node() ->
+    erlang:process_info(Pid, current_function) =/= undefined;
+deliver_signals(_Pid) ->
+    true.
