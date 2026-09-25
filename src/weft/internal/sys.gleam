@@ -28,11 +28,13 @@
 //// function clause inside a foreign module. Nothing here asserts on a
 //// decode.
 ////
-//// Two neighbours ride along because they are the same kind of thing —
+//// Three neighbours ride along because they are the same kind of thing —
 //// OTP process plumbing that a pure module must not reach for, and that
 //// would otherwise scatter `@external` across the library. `hibernate`
-//// belongs to the same "how a loop waits" question as `suspend` does, and
-//// `warn` is the single place weft speaks to the OTP logger.
+//// belongs to the same "how a loop waits" question as `suspend` does,
+//// `warn` is the single place weft speaks to the OTP logger, and
+//// `deliver_signals` is the barrier a monitor needs before anyone else is
+//// told it exists.
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
@@ -276,6 +278,37 @@ fn status_info(plane: Plane, state: state) -> system.StatusInfo {
 /// ```
 @external(erlang, "weft_sys_ffi", "hibernate")
 pub fn hibernate(continuation: fn() -> a) -> a
+
+/// Wait until every signal this process has already sent `pid` has been
+/// delivered, and report whether `pid` was alive at that point.
+///
+/// A monitor is a signal, and the BEAM orders signals only per sender and
+/// receiver pair. A process that takes out a monitor and then tells a
+/// third process to start `pid` working has ordered nothing between the
+/// monitor and that start: the third process's message can reach `pid`
+/// first, `pid` can finish and exit, and the monitor then lands on a
+/// corpse and answers `noproc` in place of the real exit reason. Calling
+/// this between the monitor and the permit closes that window, because
+/// the monitor is known to be in place before the permit is sent.
+///
+/// No binding in `gleam_erlang` gives this guarantee. `process.is_alive`
+/// is documented to, but measurably does not on OTP 29; see
+/// `weft_sys_ffi.erl`, which also explains why a remote pid answers
+/// `True`.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let monitor = process.monitor(owner)
+/// case sys.deliver_signals(owner) {
+///   // The monitor is in place: owner's exit reason will be its own.
+///   True -> permit(owner)
+///   // Already gone: the monitor's `noproc` DOWN is queued.
+///   False -> Nil
+/// }
+/// ```
+@external(erlang, "weft_sys_ffi", "deliver_signals")
+pub fn deliver_signals(pid: Pid) -> Bool
 
 /// Report something the loop could not handle to the OTP logger.
 ///

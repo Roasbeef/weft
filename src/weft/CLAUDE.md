@@ -104,7 +104,9 @@ makes sense whole.
   suspend/resume replies, observer status shape), `hibernate`, `warn`. All
   system-plane FFI lives here; registry FFI has its own internal boundary.
   The stock exit/1 binding also lives here: actor and state-machine terminal
-  abnormal exits must terminate the caller even when it traps exits.
+  abnormal exits must terminate the caller even when it traps exits. So
+  does `deliver_signals`, the engine's monitor delivery barrier
+  (`process_info/2` on a local pid; invariant 15).
 
 ## Message traffic, concretely
 
@@ -193,6 +195,15 @@ makes sense whole.
     loop would queue exit/2 as an EXIT message and then return normally.
     Actor and machine stops, including forwarded linked failures, preserve the
     exact reason in the original monitor's DOWN.
+15. **An owner's monitor is delivered before its permit leaves**
+    (`adopt_owners`, `adopt_published`). The permit to begin reaches the
+    owner by a path other than the scope's own signals — a worker, a
+    publisher's reply — and the BEAM orders signals only per sender and
+    receiver pair, so a monitor merely *sent* can be overtaken: an owner
+    that finishes at once exits unwatched and its clean exit reads as
+    `noproc`, a lost proof. `sys.deliver_signals` is the barrier.
+    `process.is_alive` is not one on OTP 29, measured: it leaves the
+    overtaking rate unchanged, where `process_info/2` removes it.
 
 ## Dependency edges (enforced by review, not tooling)
 

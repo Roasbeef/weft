@@ -576,9 +576,11 @@ pub fn managed(begin: fn(Ledger) -> Result(a, e)) -> PreparedTask(a, e) {
 ///
 /// Only a *normal* exit of `owner` will prove its subtree drained; any
 /// other exit settles the task as `DrainProofLost`. Synchronous: returns
-/// once the scope has the owner under monitor, or `Refused` at once if the
-/// scope has already exited. May be called from any process holding the
-/// ledger, any number of times, for as many owners as the task discovers.
+/// once the scope's monitor on the owner is in place — delivered, not just
+/// requested — so the owner may be started by any process and exit at
+/// once; or `Refused` at once if the scope has already exited. May be
+/// called from any process holding the ledger, any number of times, for
+/// as many owners as the task discovers.
 ///
 /// ## Examples
 ///
@@ -2011,12 +2013,18 @@ fn adopt_owners(
           // the message alone arrives too late to stop the spawn. This
           // liveness check is what actually holds `begin` back; the queued
           // `DOWN` then resolves the proof — carrying the real reason —
-          // through the ordinary dispatch. The monitor still covers an
-          // owner that dies between these two lines. Absence is recorded on
-          // the slot as well, because a task whose worker never spawns has
-          // no exit of its own to settle it: the `DOWN` must settle it as
-          // lost even for a leaf, or the account would come up one short.
-          let #(proof, pending) = case process.is_alive(owner) {
+          // through the ordinary dispatch. Absence is recorded on the slot
+          // as well, because a task whose worker never spawns has no exit
+          // of its own to settle it: the `DOWN` must settle it as lost even
+          // for a leaf, or the account would come up one short.
+          //
+          // The check is also the delivery barrier. `begin` runs in a
+          // worker, not here, and whatever it sends the owner travels a
+          // path the monitor does not; only once the monitor is known to
+          // have landed may the worker spawn, or an owner that finishes the
+          // instant it begins exits unwatched and its clean exit reads as
+          // a `noproc` lost proof.
+          let #(proof, pending) = case sys.deliver_signals(owner) {
             True -> #(ProofPending, [#(index, ignoring(begin)), ..pending])
             False -> #(ProofAbsent, pending)
           }
@@ -2250,6 +2258,15 @@ fn adopt_published(
   reply: Subject(Adoption),
 ) -> Scope(a, e) {
   let monitor = process.monitor(owner)
+
+  // `Adopted` is the publisher's permit to begin, and the owner may be
+  // started by some process other than this scope. The monitor must have
+  // landed before that permit leaves, or an owner that finishes at once
+  // can exit before it is watched and its clean exit reads as a `noproc`
+  // lost proof. An owner already gone keeps the old account: its queued
+  // `noproc` settles the slot through `judge_role`, as it always has.
+  let _alive = sys.deliver_signals(owner)
+
   let slot =
     OwnerSlot(
       index:,
