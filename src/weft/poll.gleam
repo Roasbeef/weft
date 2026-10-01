@@ -1,5 +1,18 @@
 //// Bounded polling in the caller's own process.
 ////
+//// ## Flow
+////
+//// `until` supplies `monotonic` to `until_on`. `until_on` translates a
+//// stateless `Attempt` into a `Pass` for `fold_until`, then maps its `Verdict`
+//// back to `Outcome`. `fold_until` computes the deadline and `first_gap`;
+//// `loop` probes before checking the remaining budget, clips the sleep to
+//// that budget, and computes `next_gap` before the next probe.
+////
+//// The deadline bounds waiting between probes. It cannot interrupt a probe
+//// or an injected sleep that blocks; both functions run in the caller.
+////
+//// ## Deadline contract
+////
 //// Some waits cannot be handed to another process: a launcher that needs
 //// a lock before it can do anything else, a caller reaching into a tree
 //// that may be mid-restart, a shell that must know whether a server came
@@ -101,21 +114,6 @@ pub type Clock {
     /// Rest for this many milliseconds of that same base.
     sleep: fn(Int) -> Nil,
   )
-}
-
-/// The clock `until` uses: `erlang:monotonic_time` and `process.sleep`.
-///
-/// Monotonic rather than system time, so a wall-clock step cannot lengthen
-/// or shorten a wait.
-///
-/// ## Examples
-///
-/// ```gleam
-/// poll.until_on(clock: poll.monotonic(), within: 5000, every: poll.Fixed(25), attempt:)
-/// // -> exactly what `poll.until(within: 5000, every: 25, attempt:)` does
-/// ```
-pub fn monotonic() -> Clock {
-  Clock(now: monotonic_ms, sleep: process.sleep)
 }
 
 /// How long a wait rests between attempts.
@@ -231,6 +229,21 @@ pub type Verdict(a, e, state) {
     /// The state the last attempt left behind.
     state: state,
   )
+}
+
+/// The clock `until` uses: `erlang:monotonic_time` and `process.sleep`.
+///
+/// Monotonic rather than system time, so a wall-clock step cannot lengthen
+/// or shorten a wait.
+///
+/// ## Examples
+///
+/// ```gleam
+/// poll.until_on(clock: poll.monotonic(), within: 5000, every: poll.Fixed(25), attempt:)
+/// // -> exactly what `poll.until(within: 5000, every: 25, attempt:)` does
+/// ```
+pub fn monotonic() -> Clock {
+  Clock(now: monotonic_ms, sleep: process.sleep)
 }
 
 /// Poll `attempt` until it answers, fails, or `within` milliseconds have
@@ -422,9 +435,11 @@ fn monotonic_ms() -> Int {
   monotonic_time(Millisecond)
 }
 
+/// The fixed atom required by the stock monotonic-time BIF.
 type TimeUnit {
   Millisecond
 }
 
+/// No Gleam binding exposes monotonic milliseconds; keep the stock BIF here.
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time(unit: TimeUnit) -> Int

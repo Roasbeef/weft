@@ -1,8 +1,18 @@
 //// Named-timer bookkeeping for weft's receive loops.
 ////
-//// Every loop in weft that answers a timeout — the actor's idle timeout
-//// today, the state machine's state, event and named timeouts tomorrow —
-//// has the same race to lose. `erlang:send_after` puts a message in the
+//// ## Flow
+////
+//// `new` chooses the wall clock through `new_on`. `set` cancels the old key,
+//// allocates a generation, and calls `arm` for the selected `Source`.
+//// `cancel` uses `stop` where a cancel handle exists, then removes the entry;
+//// `cancel_all` applies that operation to every key. A receive loop selects
+//// `subject` and must pass every `Fired` to `accept`, which removes a matching
+//// entry before returning `Deliver` and leaves stale fires as `Stale`.
+////
+//// ## Stale fires
+////
+//// The actor's idle and beat timers and the state machine's four timeout
+//// kinds have the same cancellation race. `erlang:send_after` puts a message in the
 //// owner's mailbox at a wall-clock moment nobody controls, so a timer can
 //// fire in the window between the loop deciding to cancel it and the cancel
 //// actually running. `erlang:cancel_timer` reports that window honestly
@@ -95,14 +105,28 @@ type Handle {
 /// set of timers already armed on the other one.
 pub opaque type Timers(key, message) {
   Timers(
+    /// The receive-loop-owned channel every wake targets.
     subject: Subject(Fired(key, message)),
+    /// The arming source fixed for this book's lifetime.
     source: Source,
+    /// The current live generation and handle for each key.
     entries: Dict(key, Entry),
+    /// The next unused stamp, retained even after all entries are canceled.
     next_generation: Int,
   )
 }
 
 /// What `accept` decided about a `Fired` message.
+///
+/// `accept` is the only transition from an arriving fire to a payload.
+///
+/// | Entry for `Fired.key` | Generation comparison | Result |
+/// |---|---|---|
+/// | Missing | Any | `Stale`; book unchanged |
+/// | Present | Equal to `Fired.generation` | `Deliver`; remove entry |
+/// | Present | Different | `Stale`; current entry retained |
+///
+/// Removing before delivery makes a duplicated wake stale on its second pass.
 pub type Delivery(key, message) {
   /// The fire is live: the timer was still armed under this generation.
   /// The entry has already been removed from the returned book, since a

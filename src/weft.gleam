@@ -1,5 +1,23 @@
 //// Owned, bounded structured concurrency.
 ////
+//// ## Flow
+////
+//// `start` and `fold` enter `drive`, which spawns `run_scope` and receives
+//// through `consume`; a halted reducer waits in `await_done`.
+//// `start_detached` and `start_witnessed` also spawn `run_scope`, then
+//// `await_ready` completes the inbox handshake. `pull` uses `await_pull`.
+//// Inside the scope, `adopt_owners` establishes the owner ledger before
+//// `loop` calls `fill_slots`, `deliver`, then `step` for one received event.
+//// Worker facts meet owner proofs in `note_outcome` and `apply_proof`.
+//// `begin_cancel` sends kills and owner cancellation requests; `loop` joins
+//// their exits until `settled` permits `finish` to publish the drain verdict.
+////
+//// The public builders come first, followed by the caller protocol and the
+//// scope protocol. Each protocol's types precede its dispatch. Read `Scope`
+//// and `Event` before following the scope's helpers.
+////
+//// ## Ownership and outcomes
+////
 //// A run is a list of tasks, a bound on how many of them may be in flight at
 //// once, and a complete account of what happened to every one of them. The
 //// account is the point: `start` hands back one `Outcome` per task, including
@@ -9,9 +27,11 @@
 ////
 //// ## Why there is an extra process
 ////
-//// The guarantee this module exists to make is *no task outlives its scope,
-//// and no scope outlives its caller*, and it is enforced by link propagation
-//// rather than by a collector loop that has to stay alive to do its job. A
+//// The scope links every worker to itself and stays linked to its caller
+//// until teardown finishes. Caller death initiates cancellation; the scope
+//// may remain alive afterward while joining workers and resolving managed
+//// owner proofs. An untrappable scope kill propagates through worker links
+//// without depending on the receive loop to perform cancellation. A
 //// library that spawns unlinked workers and reaps them from a loop degrades to
 //// "no work outlives the VM" the moment something kills that loop.
 ////
@@ -67,10 +87,13 @@
 ////
 //// Back pressure reaches the workers because a slot is occupied from the moment
 //// a task is spawned until its outcome has been *delivered*, not until the task
-//// returns. So `limit` bounds work in flight plus completed-but-unconsumed
-//// results together, and a reducer that stops reading stops the run from
-//// starting new work. The one place this bound is deliberately relaxed is
-//// cancellation, which materialises one `NeverStarted` per unstarted task in a
+//// returns. `limit` bounds occupied slots: running tasks and completed
+//// outcomes still held in the scope. Delivery releases a slot before the
+//// reducer handles the outcome, so one additional outcome may be with the
+//// consumer. New work can fill the released slot while that reducer runs;
+//// once the scope's slots fill, further spawning waits for delivery.
+//// Cancellation deliberately relaxes this bound: it
+//// materialises one `NeverStarted` per unstarted task in a
 //// single burst: those are three-word records and the task list was already a
 //// materialised list, so the cost is one that the caller had already paid.
 ////
@@ -141,9 +164,10 @@
 //// cleanly has already stopped them.
 ////
 //// `start_witnessed` is the run shape for a caller that wants only that
-//// witness: no outcomes are delivered, and the scope's pid — alive exactly
-//// while any worker, owner or cancel helper is, exiting with the verdict —
-//// is the whole report; the handle it returns carries that pid and
+//// witness: no outcomes are delivered. The scope waits for workers and
+//// cancellation helpers to exit and for every owner proof to resolve, then
+//// exits with the verdict. That monitored exit is the whole report;
+//// the handle carries the scope pid and
 //// `cancel_witnessed`. `cancel_when_exits` names a consumer whose death
 //// should end such a run when that consumer is not the caller.
 ////
@@ -152,7 +176,8 @@
 //// A run can be stopped from three directions: `on_failure(CancelSiblings)`
 //// when a task fails, `deadline` when the wall clock runs out, and
 //// `cancel_with` when some *other* process decides to end a run the caller is
-//// blocked inside. All three converge on `begin_cancel`.
+//// blocked inside. `cancel_when_exits` and the detached cancellation verbs
+//// use the same `begin_cancel` path.
 ////
 //// The scope cancels a worker with `process.kill`, so a cancelled worker's exit
 //// reason is `Killed` — and so is the exit reason of a worker some unrelated
@@ -197,6 +222,12 @@
 //// exit as mailbox noise, because the scope drops the link itself just before
 //// it returns; the link is live for the whole run, which is the part that
 //// matters.
+////
+//// Managed work adds an important limit: `DrainProofLost` and
+//// `CancellationUnconfirmed` report missing evidence about external work.
+//// Returning the account does not prove that work stopped. Use the outcomes
+//// and the scope's monitored exit verdict when deciding whether to reuse
+//// resources whose lifetime extends beyond the worker.
 ////
 //// ## Quick start
 ////
@@ -419,20 +450,30 @@ type OwnerRole {
 /// has the owner under monitor.
 pub opaque type PreparedTask(a, e) {
   /// A plain task: worker exit and work stopping are the same fact.
-  PlainTask(begin: fn() -> Result(a, e))
+  PlainTask(
+    /// The leaf computation run on the scope's linked worker.
+    begin: fn() -> Result(a, e),
+  )
 
   /// A managed task: the work persists beyond the worker, and `owner`'s
   /// exit is what settles it.
   OwnedTask(
+    /// The prepared process whose exit establishes the drain fact.
     owner: Pid,
+    /// The idempotent request to stop the owner, run on a helper.
     cancel: fn() -> Nil,
+    /// Whether this owner is a leaf or vouches for a subtree.
     role: OwnerRole,
+    /// Release parked work after the scope has adopted its owner.
     begin: fn() -> Result(a, e),
   )
 
   /// A task that discovers its owners as it runs and publishes each one
   /// through the ledger `begin` receives.
-  LedgeredTask(begin: fn(Ledger) -> Result(a, e))
+  LedgeredTask(
+    /// Work receiving the capability to publish owners before releasing them.
+    begin: fn(Ledger) -> Result(a, e),
+  )
 }
 
 /// A running managed task's capability to publish owners to its scope.
@@ -444,7 +485,14 @@ pub opaque type PreparedTask(a, e) {
 /// charged to the task that discovered the owner, and the scope pid rides
 /// inside so a caller can tell a refusal from a scope that is already gone.
 pub opaque type Ledger {
-  Ledger(scope: Pid, inbox: Subject(Request), index: Int)
+  Ledger(
+    /// The witness monitored while publishing an owner.
+    scope: Pid,
+    /// The channel for synchronous publication requests.
+    inbox: Subject(Request),
+    /// The task charged with every owner published through this capability.
+    index: Int,
+  )
 }
 
 /// The scope's answer to an adoption.
@@ -700,13 +748,19 @@ fn publish(
 /// value, so the same one can be started more than once.
 pub opaque type Run(a, e) {
   Run(
+    /// Work in input order, prepared before the scope starts.
     tasks: List(PreparedTask(a, e)),
+    /// Occupied task slots; the consumer may hold one delivered outcome too.
     limit: Int,
+    /// Whether a sealed failure starts cancellation of its siblings.
     on_failure: OnFailure,
+    /// A separately owned cancellation signal monitored by the scope.
     signal: Option(Cancel),
     /// Processes whose exit cancels the run, from `cancel_when_exits`.
     watched: List(Pid),
+    /// Run deadline on the wall clock, if configured.
     within: Option(Int),
+    /// One cancellation grace window for unresolved owners, if configured.
     grace: Option(Int),
   )
 }
@@ -767,9 +821,10 @@ pub fn new_prepared(tasks: List(PreparedTask(a, e))) -> Run(a, e) {
 /// Set how many tasks may occupy a slot at once.
 ///
 /// A slot is held from the moment a task is spawned until its outcome has been
-/// handed to the consumer, so this bounds running work and completed-but-
-/// unconsumed results together. A `max` below one is raised to one; there is no
-/// unbounded setting, by design.
+/// handed to the consumer. It bounds running tasks and completed outcomes
+/// still held by the scope, with at most one additional delivered outcome
+/// outside that bound. It is a count of slots, not a byte or memory budget.
+/// A `max` below one is raised to one; there is no unbounded setting.
 ///
 /// ## Examples
 ///
@@ -936,11 +991,12 @@ pub fn start(run: Run(a, e)) -> List(Outcome(a, e)) {
 
 /// Consume outcomes in **completion** order as they land.
 ///
-/// This is how a run whose results do not all fit in memory is processed, and
+/// This is how a run avoids retaining its whole result account, and
 /// how a caller acts on early results without waiting for the slow tail. The
 /// scope holds each outcome until the reducer asks for it, so at most one is
 /// ever in flight and a slow reducer stops new work from starting rather than
-/// filling a mailbox.
+/// filling a mailbox. Already delivered outcomes and worker exit bookkeeping
+/// are outside the occupied-slot count; this is not a heap-size bound.
 ///
 /// A reducer returning `Halt` ends the run: the remaining tasks are killed and
 /// joined before `fold` returns, so no worker survives the call. The outcomes
@@ -1026,10 +1082,11 @@ pub type Pulled(a, e) {
     outcome: Outcome(a, e),
   )
 
-  /// Every outcome has been delivered; the run is over and nothing it
-  /// started is alive. Stop pulling: there is nothing left to pull, and a
-  /// later `pull` will report the scope's exit as `RunLost` rather than
-  /// repeating this answer.
+  /// The scope sent `Done`, or the current pull observed a normal exit.
+  /// Its workers and cancellation helpers have exited and every owner proof
+  /// has resolved. Outcomes may still report lost or unconfirmed drain of
+  /// external work. Stop pulling; a new monitor on the exited scope usually
+  /// observes `noproc` and yields `RunLost` rather than repeating this answer.
   AllDelivered
 
   /// Nothing landed within the wait. The demand stands — the scope holds at
@@ -1192,14 +1249,26 @@ pub fn scope_pid(detached: Detached(a, e)) -> Pid {
   detached.scope
 }
 
+/// A handle to a witnessed run: the scope to monitor, and the one verb a
+/// witness-only caller still needs, cancellation.
+pub opaque type Witnessed {
+  Witnessed(
+    /// The scope process, whose exit is the run's whole report.
+    scope: Pid,
+    /// Where cancellation is sent.
+    inbox: Subject(Request),
+  )
+}
+
 /// Start a run whose only report is the scope's exit, and hand back a
 /// handle carrying the scope's pid and cancellation.
 ///
 /// Nothing is delivered to anyone: each outcome is discarded the moment it
 /// is sealed, and its slot returned. What remains is the part a drain
-/// witness needs — the scope is alive exactly while any worker, any
-/// adopted owner, or any cancel helper is, and it exits normally only if
-/// every proof landed. This is the shape for a run started purely to
+/// witness needs: the scope waits for workers and helpers to exit and for
+/// every owner proof to resolve. Grace expiry may resolve a proof while its
+/// owner is still alive; only a normal scope exit proves every drain.
+/// This is the shape for a run started purely to
 /// *witness* work: the caller monitors `witness_pid`, cancels with
 /// `cancel_witnessed`, and reads the verdict off the `DOWN`.
 ///
@@ -1236,17 +1305,6 @@ pub fn start_witnessed(run: Run(a, e)) -> Witnessed {
   process.demonitor_process(watch)
 
   Witnessed(scope:, inbox:)
-}
-
-/// A handle to a witnessed run: the scope to monitor, and the one verb a
-/// witness-only caller still needs, cancellation.
-pub opaque type Witnessed {
-  Witnessed(
-    /// The scope process, whose exit is the run's whole report.
-    scope: Pid,
-    /// Where cancellation is sent.
-    inbox: Subject(Request),
-  )
 }
 
 /// The scope process behind a witnessed run: the pid to monitor, and the
@@ -1594,8 +1652,11 @@ type Request {
   /// with whether custody crossed; the owner is retained either way.
   Publish(
     index: Int,
+    /// The prepared process whose exit establishes the drain fact.
     owner: Pid,
+    /// Whether this owner is a leaf or vouches for a subtree.
     role: OwnerRole,
+    /// The idempotent request to stop the owner, run on a helper.
     cancel: fn() -> Nil,
     parent: Option(Pid),
     reply: Subject(Adoption),
@@ -1645,6 +1706,8 @@ fn drive(
   answer
 }
 
+/// Normalize process and port monitor variants into the caller protocol.
+/// Only a process monitor is installed here; both constructors are decoded.
 fn scope_down(down: process.Down) -> CallerEvent(a, e) {
   case down {
     process.ProcessDown(reason:, ..) -> ScopeDown(reason:)
@@ -1669,9 +1732,9 @@ fn consume(
     FromScope(Delivered(inbox:, outcome:)) ->
       case reducer(accumulator, outcome) {
         Continue(accumulator:) -> {
-          // Asking for the next outcome is also what frees the finished task's
-          // slot, so a reducer that takes its time throttles the run rather
-          // than filling this mailbox.
+          // Delivery already returned the slot. `Next` grants permission
+          // for one more delivery, so the scope can refill that slot while
+          // the reducer runs without pushing more outcomes into this mailbox.
           process.send(inbox, Next)
           consume(replies, accumulator, reducer)
         }
@@ -1743,6 +1806,21 @@ type Event(a, e) {
 }
 
 /// Which fact a managed owner's exit has established so far.
+///
+/// `judge_exit` and `expire_grace` implement these owner transitions.
+/// `apply_proof` then combines the owner's fact with the worker's outcome.
+///
+/// | Current proof | Event and owner role | Next proof |
+/// |---|---|---|
+/// | `ProofAbsent` | Owner `WatchedDown`, any reason or role | `ProofLost(reason)` |
+/// | `ProofPending` | Owner `WatchedDown`, `Leaf`, any reason | `ProofDrained` |
+/// | `ProofPending` | Owner `WatchedDown`, `Transitive`, `Normal` | `ProofDrained` |
+/// | `ProofPending` | Owner `WatchedDown`, `Transitive`, abnormal or killed | `ProofLost(reason)` |
+/// | `ProofPending` | `GracePassed` | `ProofUnconfirmed` |
+///
+/// The monitor identifies the owner slot, not just its pid. A dynamically
+/// published owner begins at `ProofPending` even if already dead; only an
+/// owner prepared before the run can begin at `ProofAbsent`.
 type Proof {
   /// The owner is still alive; the task's outcome is withheld.
   ProofPending
@@ -1796,7 +1874,8 @@ type OwnerSlot {
 
 /// The run-wide drain verdict, carried out of the scope as its exit reason.
 /// Strictly ordered: a lost proof outranks an unconfirmed cancellation,
-/// which outranks a clean drain, and `worsen` only ever moves up.
+/// which outranks a clean drain. `worsen_for` and `worsen_to_unconfirmed`
+/// never improve an earlier verdict.
 type Verdict {
   AllDrained
 
@@ -1805,10 +1884,27 @@ type Verdict {
   SomeLost
 }
 
-/// Where the caller is in the conversation. This is a four-state machine rather
+/// Where the caller is in the conversation. This is a five-state machine rather
 /// than a pair of booleans because the states are not independent: only
 /// `Waiting` may be delivered to, and `Halted` and `Gone` differ solely in
 /// whether anyone is left to hear the final `Done`.
+///
+/// Delivery transitions are owned by `deliver`, `note_demand`, `detach` and
+/// `queue_outcome`. Cancellation and delivery are separate: `CancelRun` keeps
+/// the consumer state so the caller can still collect its account.
+///
+/// | Current consumer | Event or operation | Next consumer |
+/// |---|---|---|
+/// | `Waiting` | `deliver` finds an outcome | `Busy` |
+/// | `Busy` | `Asked(Next)` | `Waiting` |
+/// | `Waiting` | `Asked(Next)` | `Waiting` |
+/// | `Waiting` or `Busy` | `Asked(Stop)` | `Halted` |
+/// | Any | `Exited` from caller | `Gone` |
+/// | `Halted`, `Gone` or `Discarding` | `Asked(Next)` | Unchanged |
+/// | `Discarding` | `queue_outcome` | Unchanged; slot returned |
+///
+/// `start_witnessed` starts in `Discarding`; no request switches a delivering
+/// consumer into that state.
 type Consumer {
   /// Blocked on the next outcome. The scope may deliver.
   Waiting
@@ -1939,8 +2035,8 @@ fn run_scope(
   // Owners before workers, unconditionally: adopting every owner here, ahead
   // of the first `fill_slots`, is what makes "the scope holds ownership
   // evidence before `begin` runs" true by construction rather than by
-  // handshake. An owner that is already dead queues its `DOWN` immediately,
-  // so the ordinary dispatch catches it before its task's worker can spawn.
+  // handshake. `adopt_owners` excludes a dead owner's task from the spawn
+  // queue; its `DOWN` later resolves the proof through the ordinary dispatch.
   let #(owners, pending) = adopt_owners(indexed)
 
   let scope =
@@ -2018,7 +2114,7 @@ fn adopt_owners(
           // of its own to settle it: the `DOWN` must settle it as lost even
           // for a leaf, or the account would come up one short.
           //
-          // The check is also the delivery barrier. `begin` runs in a
+          // `sys.deliver_signals` is also the delivery barrier. `begin` runs in a
           // worker, not here, and whatever it sends the owner travels a
           // path the monitor does not; only once the monitor is known to
           // have landed may the worker spawn, or an owner that finishes the
@@ -2383,14 +2479,11 @@ fn ask_children(scope: Scope(a, e), parent: OwnerSlot) -> Scope(a, e) {
 /// What one exit reason proves, given what the owner was declared to be
 /// and whether it was ever alive under watch.
 ///
-/// The full matrix is spelled out because the corner that matters hides in
-/// it: a `noproc` `DOWN` — the owner was dead before the scope could watch
-/// it — arrives as an abnormal reason, and that is a lost proof whatever
-/// the role, because a leaf exemption covers an ordinary crash of work
-/// that ran, not an owner that was a corpse before `begin` was admitted.
-/// Proof that was never on file was never proof. For an owner that was
-/// alive at adoption, the role decides: any exit completes a leaf, and
-/// only a normal exit proves a transitive subtree drained.
+/// A prepared owner already dead at adoption carries `ProofAbsent`; its
+/// queued DOWN loses proof regardless of role because `begin` was never
+/// admitted. A dynamically published owner instead begins at `ProofPending`,
+/// including one already dead, and is judged by role. Any pending leaf exit
+/// proves drain; a pending transitive owner requires a normal exit.
 fn judge_exit(slot: OwnerSlot, reason: ExitReason) -> Proof {
   case slot.proof {
     ProofAbsent -> ProofLost(reason:)
@@ -2404,8 +2497,9 @@ fn judge_exit(slot: OwnerSlot, reason: ExitReason) -> Proof {
   }
 }
 
-/// The role's half of the judgement, for an owner that was alive under
-/// watch.
+/// The role's half of the judgement for a pending owner. Dynamic adoption
+/// uses this even when the owner was already dead; preparation can record
+/// `ProofAbsent` and bypass this role exemption.
 fn judge_role(role: OwnerRole, reason: ExitReason) -> Proof {
   case role, reason {
     Leaf, process.Normal -> ProofDrained
@@ -2489,7 +2583,8 @@ fn reach_forward(scope: Scope(a, e), index: Int, proof: Proof) -> Scope(a, e) {
 /// The proof a task's whole owner set has established. Loss outranks an
 /// unconfirmed cancellation, which outranks anything still pending, which
 /// outranks a clean drain — so a task is drained only when every owner is,
-/// and lost as soon as any one is. `None` is a task with no owners at all.
+/// and lost as soon as any one is. With no owners the fold returns
+/// `ProofDrained`; `proof_for` distinguishes that case with `None`.
 fn aggregate_proof(owners: List(OwnerSlot), index: Int) -> Proof {
   list.fold(owners, ProofDrained, fn(sum, slot) {
     use <- bool.guard(when: slot.index != index, return: sum)
@@ -2958,10 +3053,12 @@ type Backlog(a, e) {
   Backlog(front: List(Outcome(a, e)), back: List(Outcome(a, e)))
 }
 
+/// Start an empty delivery queue; neither list retains an outcome.
 fn new_backlog() -> Backlog(a, e) {
   Backlog(front: [], back: [])
 }
 
+/// Append in arrival order by consing onto the reversed back list.
 fn push_backlog(
   backlog: Backlog(a, e),
   outcome: Outcome(a, e),
@@ -2969,6 +3066,8 @@ fn push_backlog(
   Backlog(..backlog, back: [outcome, ..backlog.back])
 }
 
+/// Take the oldest outcome, reversing the back list only when front is empty.
+/// Each outcome crosses that reversal once, giving amortized constant-time pops.
 fn pop_backlog(
   backlog: Backlog(a, e),
 ) -> Result(#(Outcome(a, e), Backlog(a, e)), Nil) {
@@ -2982,6 +3081,7 @@ fn pop_backlog(
   }
 }
 
+/// Check both halves without reversing or traversing either list.
 fn backlog_is_empty(backlog: Backlog(a, e)) -> Bool {
   list.is_empty(backlog.front) && list.is_empty(backlog.back)
 }
@@ -2998,10 +3098,13 @@ fn default_limit() -> Int {
   int.max(1, system_info(SchedulersOnline))
 }
 
+/// The one stock system-info query used to choose default fan-out.
+/// Its constructor compiles to the fixed Erlang atom `schedulers_online`.
 type SystemQuery {
   SchedulersOnline
 }
 
+/// The stock BIF supplying scheduler count; gleam_erlang exposes no binding.
 @external(erlang, "erlang", "system_info")
 fn system_info(query: SystemQuery) -> Int
 
