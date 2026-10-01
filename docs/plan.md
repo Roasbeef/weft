@@ -1,15 +1,22 @@
 # Plan of record
 
 Rewritten at the close of the initial build-out (2026-08-31), and amended
-as each phase landed. Six public modules are on `main` — the run engine,
-`actor`, `state_machine`, `event_manager`, `poll` and `timer` — every gate
-green: 163 tests, lint 0 errors, doc graph clean.
+as each phase landed. The committed tree contains seven public modules:
+the run engine, `actor`, `state_machine`, `event_manager`, `poll`, `timer`
+and `registry`. The latest verification for this documentation pass is
+recorded below; earlier test counts describe their original milestones.
+
+[Architecture](architecture.md) follows the admission, delivery and drain
+paths. [Reading guide](reading-guide.md) explains the source order and
+Gleam-specific patterns. The per-module `Flow` maps and adjacent transition
+tables name the existing functions and constructors; they introduce no
+additional lifecycle, API or enforcement mechanism.
 
 ## What landed
 
 | Module | Design | Landed | Notes |
 |---|---|---|---|
-| `weft` | [#1](https://github.com/Roasbeef/weft/issues/1) (open) | `6fa884b`..`92c8699` | Pull-based delivery; slot held until delivery, so `limit` bounds work plus unconsumed results |
+| `weft` | [#1](https://github.com/Roasbeef/weft/issues/1) (open) | `6fa884b`..`92c8699` | Pull-based delivery; slot held until send, with one additional delivered outcome at the consumer |
 | `weft/actor` | [#4](https://github.com/Roasbeef/weft/issues/4) (closed) | `3cf3436`..`3b70c62` | Superset of upstream; continues, `on_shutdown`, hibernation, idle timeout |
 | `weft/state_machine` | [#2](https://github.com/Roasbeef/weft/issues/2) (closed) | `9da435e`..`a034557` | `Enter` vs `Next` via phantom marker on opaque `Step` |
 | `weft/event_manager` | [#3](https://github.com/Roasbeef/weft/issues/3) (closed) | `48f8fbe`, `d2b2a54` | Built on `weft/actor`; no loop of its own |
@@ -27,7 +34,9 @@ type on #2). Where this file and the code disagree, measure the code.
 
 ## Rulings made during the build (beyond the issues)
 
-- Engine delivery is pull, not push; the ack doubles as slot release.
+- Engine delivery is pull, not push. `deliver` releases a slot when sending
+  an outcome; the caller's `Next` grants the next delivery. One delivered
+  outcome may be outside the occupied-slot bound.
 - `race(first, rest)` — the empty race is unrepresentable.
 - Loser cancellation for `race`/`first_ok` rides on `fold`+`Halt`; no
   third scope-side policy.
@@ -79,8 +88,10 @@ came back for, and it settled these:
   while any is pending, drained only when all are. A task is sealed at
   most once (`Scope.sealed`), so a second owner resolving after a lost
   proof cannot write the account twice.
-- A refused adoption still retains and asks the owner. The permit is what
-  refusal withholds, never the witness.
+- A refused publication to a live scope still retains its owner under
+  monitor. Cancellation or an orphaned parent dispatches a stop request
+  using the existing staging rules. Refusal solely because the account is
+  sealed retains the witness without dispatching a stop request.
 - Owners adopted mid-run are judged by role even when already dead at
   adoption (`ProofPending`, not `ProofAbsent`): the caller asked us to
   witness something it had already started, and whether its death lost a
@@ -256,6 +267,32 @@ regressions install their monitors before triggering termination: direct
 normal and abnormal stops on both loops, plus forwarding an exact tuple
 reason from a linked process on each loop. No public API or helper Erlang
 module is added.
+
+## Literate source and documentation pass
+
+The source now gives a short `Flow` map in each large module and compact
+transition tables beside `Consumer`, `Proof`, actor `Next`, machine `Step`,
+event-manager `Outcome`, timer `Delivery` and system `Plane`. The registry's
+private types, binding operations and foreign edges explain monitor custody,
+replacement ordering and table ownership. Small protocol types move ahead
+of the functions that consume them, keeping behavior and signatures intact.
+
+The pass also reconciles prose with existing code. `Consumer` has five states;
+monitor delivery, not an assumed first DOWN dispatch, gates prepared worker
+admission. Slot release happens at delivery, while `Next` grants demand.
+A finished account can still contain lost or unconfirmed external drain.
+Actor and machine `supervised` builders retain the configured linkage.
+The scope's suspension serves only system traffic and does not freeze its
+deadline or grace, whereas actor and machine timers restart on resume.
+
+Verification on the documentation candidate: `make check` exited 0 with
+183 tests passing, no build warnings, lint 0 errors and 0 warnings, and a
+clean doc graph. `make docs` exited 0. Comment-free declaration comparison
+preserved every Gleam body, signature and external binding; Erlang code
+was identical after removing comments. Independent correctness review
+identified stale delivery, refusal, and caller-lifetime guarantees; those
+claims now match the handlers. No runtime behavior, exported signature, dependency,
+vendored lint or test changes are part of this pass.
 
 ## Deferred, deliberately
 

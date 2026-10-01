@@ -1,6 +1,25 @@
 //// A typed `gen_statem`: a state ADT, a data value, postponed events, and
 //// the four timeout kinds, on a receive loop weft owns.
 ////
+//// ## Flow
+////
+//// `start` spawns `initialise_machine`, which loads `Self`, acknowledges
+//// startup, then calls `enter` for the initial state. `loop` selects the
+//// suspended or running path; `run` drains queued events before receiving
+//// through `running_selector` and `dispatch`.
+//// `handle` cancels the event timeout and passes the event callback's step
+//// to `commit`. `commit` uses `hold` and `retarget`, then either stays in
+//// `loop` or calls `changed_state` to replay postponed events and call `enter`.
+//// `handle_fired` checks the timer book before invoking `handle`.
+//// `apply_timeouts` precedes `rearm_repeating`; `handle_system` uses
+//// `rearm_all` when resuming. `exit_process` owns terminal failure reasons.
+////
+//// `Step`, `Target`, `TimeoutAction`, `Cadence` and `TimerKey` define the
+//// callback decisions before their builders. `Self`, `Arming`, `Event` and
+//// `Frozen` define receive-loop state before the implementation.
+////
+//// ## Terminal exits
+////
 //// Terminal abnormal stops raise exit/1 through internal/sys. A trapping
 //// machine must terminate with that reason, not queue it as a self-directed
 //// EXIT and then return normally. Linked failures use the same terminal path.
@@ -298,20 +317,38 @@ pub type Unpostponable
 /// What the machine does after a callback returns.
 ///
 /// Built with `transition`, `keep`, `stop` or `stop_abnormal`, and refined
-/// with `postpone`, the three `with_*_timeout` actions, `cancel_timeout` and
+/// with `postpone`, the four `with_*_timeout` actions, `cancel_timeout` and
 /// `then_handle`. Actions apply in the order they are written.
 ///
 /// The fourth type parameter records where the step may be used. Callers
 /// normally write `Next` or `Enter` rather than naming `Step` at all; it is
 /// public because those two are aliases of it, and opaque because a step's
 /// fields are the loop's business.
+///
+/// `commit` owns these transitions. Equality compares the entire `state`
+/// value, including any constructor fields; replacing only `data` stays put.
+///
+/// | Step target | State comparison | Commit path |
+/// |---|---|---|
+/// | `Advance(Keeping(data), ..)` | Same state | Apply actions; no replay or enter |
+/// | `Advance(Moving(state, data), ..)` | Equal to previous state | Apply actions; no replay or enter |
+/// | `Advance(Moving(state, data), ..)` | Unequal to previous state | `changed_state`: cancel state timer, replay, apply actions, enter |
+/// | `Halt(reason)` | Any | `exit_process`; discard queued work |
+///
+/// Every advancing path applies its timer actions before `rearm_repeating`.
+/// An enter callback uses the same commit path but has no current event;
+/// its `Unpostponable` marker prevents a call to `postpone`.
 pub opaque type Step(state, data, message, postponing) {
   /// Carry on: stay put or move, having queued `injected` and the timeout
   /// changes in `timeouts`, and optionally re-queueing the event in hand.
   Advance(
+    /// The replacement data and optional state move.
     target: Target(state, data),
+    /// Whether the current event joins the postponed queue.
     postponed: Bool,
+    /// Events to handle before replayed events and the mailbox.
     injected: List(message),
+    /// Timer actions in the order the callback built them.
     timeouts: List(TimeoutAction(message)),
     /// A replacement for the selector the loop receives with, from
     /// `with_selector`. `None` keeps the current one.
@@ -320,7 +357,10 @@ pub opaque type Step(state, data, message, postponing) {
 
   /// Stop, exiting with this reason. Pending injected messages, postponed
   /// events and anything in the mailbox are discarded.
-  Halt(reason: ExitReason)
+  Halt(
+    /// The terminal reason published to links and monitors.
+    reason: ExitReason,
+  )
 }
 
 /// What an event handler returns: a step that may postpone the event it was
@@ -759,10 +799,15 @@ pub fn then_handle(
 /// `continuing`.
 pub opaque type Initialised(state, data, message, return) {
   Initialised(
+    /// The initial state used for equality and state-timeout policy.
     state: state,
+    /// The initial callback data, independent of the state identity.
     data: data,
+    /// An initial selector, or the process subject when absent.
     selector: Option(Selector(message)),
+    /// The value acknowledged to the starting process.
     return: return,
+    /// Events to handle before replayed events and the mailbox.
     injected: List(message),
   )
 }
@@ -1107,9 +1152,9 @@ pub type Linkage {
 ///
 /// Consumers that need this otherwise pay for it with a throwaway
 /// process that starts the machine and exits, which leaves the machine
-/// linked to a corpse; this is that arrangement made a setting. Only
-/// `start` reads it — a supervisor always links its children, so
-/// `supervised` ignores it.
+/// linked to a corpse; this is that arrangement made a setting.
+/// `supervised` passes the builder to `start` unchanged, so keep the linked
+/// default when using a supervisor that requires its child to start linked.
 ///
 /// ## Examples
 ///
@@ -1191,9 +1236,16 @@ pub fn with_timer_source(
 
 // ------------------------------------------------------------------ start
 
+/// What `start` is waiting for: the child's acknowledgement, or its death.
+type StartEvent(data) {
+  Ack(Result(data, String))
+  Died(process.Down)
+}
+
 /// Start a state machine from a builder.
 ///
-/// The new process is linked to the caller, and the caller blocks until the
+/// The new process uses the builder's linkage (linked by default), and the
+/// caller blocks until the
 /// initialiser has finished or the initialisation timeout expires. The
 /// initial enter callback and any messages added with `continuing` are
 /// handled after this returns and before any message sent afterwards.
@@ -1254,18 +1306,16 @@ pub fn start(
   }
 }
 
-/// What `start` is waiting for: the child's acknowledgement, or its death.
-type StartEvent(data) {
-  Ack(Result(data, String))
-  Died(process.Down)
-}
-
 /// Describe this machine as a supervisor's child.
 ///
 /// Returns `gleam/otp/supervision`'s own `ChildSpecification`, so a weft
 /// state machine is added to a `gleam_otp` supervisor exactly as an upstream
 /// actor is. The default is a permanent worker with a five-second shutdown;
 /// refine it with `supervision.restart`, `supervision.timeout` and friends.
+///
+/// The specification calls `start` with this builder unchanged. It retains
+/// `unlinked` if configured; keep the linked default for supervisors that
+/// require their start callback to return a linked child.
 ///
 /// ## Examples
 ///
@@ -1345,7 +1395,7 @@ type Self(state, data, message) {
     /// Whether exit signals arrive as messages. Decides whether the loop
     /// installs the trapped-exit arm at all.
     trapping: Bool,
-    /// The timer book: the three timeout kinds and the flush that makes a
+    /// The timer book: all four timeout kinds and the flush that makes a
     /// cancelled one safe.
     timers: book.Timers(TimerKey, message),
     /// What each live timer was armed *with*. The book is opaque and cannot
@@ -1387,6 +1437,19 @@ type Event(message) {
 
   /// A message no selector arm claimed. Discarded with a warning.
   Unexpected(message: Dynamic)
+}
+
+/// What a suspended machine is still willing to receive.
+///
+/// Two things, and no more. The debug plane, because `resume` arrives on it
+/// and a suspension nothing can lift is a hang. And, for a machine that
+/// traps exits, an exit signal — because a supervisor shutting down a
+/// suspended child would otherwise wait out its whole shutdown timeout and
+/// then kill it. OTP's own `sys:suspend_loop` makes the same exception for
+/// the same reason.
+type Frozen {
+  FrozenSystem(incoming: sys.Incoming)
+  FrozenExit(exit: process.ExitMessage)
 }
 
 /// Run the machine's initialisation in the newly spawned process and, if it
@@ -1470,19 +1533,6 @@ fn register_self(name: process.Name(message)) -> Result(Nil, String) {
     Ok(Nil) -> Ok(Nil)
     Error(Nil) -> Error("name already registered")
   }
-}
-
-/// What a suspended machine is still willing to receive.
-///
-/// Two things, and no more. The debug plane, because `resume` arrives on it
-/// and a suspension nothing can lift is a hang. And, for a machine that
-/// traps exits, an exit signal — because a supervisor shutting down a
-/// suspended child would otherwise wait out its whole shutdown timeout and
-/// then kill it. OTP's own `sys:suspend_loop` makes the same exception for
-/// the same reason.
-type Frozen {
-  FrozenSystem(incoming: sys.Incoming)
-  FrozenExit(exit: process.ExitMessage)
 }
 
 /// The receive loop.
@@ -1831,7 +1881,7 @@ fn retarget(
 
 /// Finish a step that changed the state.
 ///
-/// Three things happen here, and the order between them is the contract:
+/// Four things happen here, and the order between them is the contract:
 ///
 /// 1. The state timeout is cancelled, *before* the step's own timer actions
 ///    run, so that a state timeout armed by the very transition that leaves

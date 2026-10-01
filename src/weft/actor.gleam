@@ -1,6 +1,22 @@
 //// A strict superset of `gleam/otp/actor`'s builder, on a receive loop weft
 //// owns.
 ////
+//// ## Flow
+////
+//// `start` spawns `initialise_actor`, which creates the subject, runs the
+//// initialiser, loads `Self.queue`, and acknowledges startup before `loop`.
+//// `loop` selects the suspended or running path. `run` handles queued work
+//// before `await_message` receives through `running_selector` and `dispatch`.
+//// `handle` applies the callback's `Next`; `handle_tick` accepts a timer fire
+//// before using that same path. `handle_system` freezes or restores timers.
+//// `shutdown` runs the optional callback before `exit_process` terminates.
+////
+//// `Next`, `Initialised` and `Builder` describe the public decisions first.
+//// `Self`, `Beating`, `TimerKey`, `Event` and `Frozen` describe loop custody
+//// before the loop implementation.
+////
+//// ## Terminal exits
+////
 //// Terminal abnormal stops raise exit/1 through internal/sys. A trapping
 //// actor must terminate with that reason, not queue it as a self-directed
 //// EXIT and then return normally. Shutdown callbacks still run first.
@@ -144,18 +160,36 @@ pub type StartError =
 ///
 /// Built with `continue`, `stop` or `stop_abnormal`, and refined with
 /// `with_selector` and `then_handle`.
+///
+/// `handle` interprets these decisions after a user message or accepted tick.
+///
+/// | Callback decision | Loop operation | Result |
+/// |---|---|---|
+/// | `Continue` | Replace state and optional selector; prepend injected messages | `loop` |
+/// | `Stop(Normal)` | Run shutdown callback | Return normally |
+/// | `Stop(Abnormal(reason))` | Run shutdown callback | `exit_process` preserves reason |
+/// | `Stop(Killed)` | Run shutdown callback | Untrappable self-kill |
+///
+/// An untrappable kill received from outside bypasses the loop and callback.
+/// A callback that raises also bypasses the `Next` interpretation.
 pub opaque type Next(state, message) {
   /// Carry on with `state`, optionally replacing the selector, and handle
   /// `injected` — in order — before anything in the mailbox.
   Continue(
+    /// The replacement user state for the next handler invocation.
     state: state,
+    /// A replacement selector, or the current one when absent.
     selector: Option(Selector(message)),
+    /// Messages to handle in order before the previously queued tail.
     injected: List(message),
   )
 
   /// Stop, exiting with this reason. Any queued injected messages and
   /// anything in the mailbox are discarded.
-  Stop(reason: ExitReason)
+  Stop(
+    /// The terminal reason used after the shutdown callback.
+    reason: ExitReason,
+  )
 }
 
 /// Continue, processing any waiting or future messages.
@@ -293,9 +327,13 @@ pub fn then_handle(
 /// `continuing`.
 pub opaque type Initialised(state, message, data) {
   Initialised(
+    /// The user state handed to the loop after startup.
     state: state,
+    /// The initial selector, or the actor's subject when absent.
     selector: Option(Selector(message)),
+    /// The startup value acknowledged to the parent.
     return: data,
+    /// Startup messages handled in order before mailbox traffic.
     injected: List(message),
   )
 }
@@ -615,9 +653,9 @@ pub type Linkage {
 ///
 /// Consumers that need this otherwise pay for it with a throwaway
 /// process that starts the actor and exits, which leaves the actor
-/// linked to a corpse; this is that arrangement made a setting. Only
-/// `start` reads it — a supervisor always links its children, so
-/// `supervised` ignores it.
+/// linked to a corpse; this is that arrangement made a setting.
+/// `supervised` passes the builder to `start` unchanged, so keep the linked
+/// default when using a supervisor that requires its child to start linked.
 ///
 /// ## Examples
 ///
@@ -869,9 +907,16 @@ pub fn with_timer_source(
 
 // ------------------------------------------------------------------ start
 
+/// What `start` is waiting for: the child's acknowledgement, or its death.
+type StartEvent(data) {
+  Ack(Result(data, String))
+  Died(process.Down)
+}
+
 /// Start an actor from a builder.
 ///
-/// The new process is linked to the caller, and the caller blocks until the
+/// The new process uses the builder's linkage (linked by default), and the
+/// caller blocks until the
 /// initialiser has finished or the initialisation timeout expires. Messages
 /// added with `continuing` are handled after this returns and before any
 /// message sent afterwards.
@@ -932,18 +977,16 @@ pub fn start(
   }
 }
 
-/// What `start` is waiting for: the child's acknowledgement, or its death.
-type StartEvent(data) {
-  Ack(Result(data, String))
-  Died(process.Down)
-}
-
 /// Describe this actor as a supervisor's child.
 ///
 /// Returns `gleam/otp/supervision`'s own `ChildSpecification`, so a weft
 /// actor is added to a `gleam_otp` supervisor exactly as an upstream one is.
 /// The default is a permanent worker with a five-second shutdown; refine it
 /// with `supervision.restart`, `supervision.timeout` and friends.
+///
+/// The specification calls `start` with this builder unchanged. It retains
+/// `unlinked` if configured; keep the linked default for supervisors that
+/// require their start callback to return a linked child.
 ///
 /// ## Examples
 ///
@@ -1071,6 +1114,19 @@ type Event(message) {
   Unexpected(message: Dynamic)
 }
 
+/// What a suspended actor is still willing to receive.
+///
+/// Two things, and no more. The debug plane, because `resume` arrives on it
+/// and a suspension nothing can lift is a hang. And, for an actor that traps
+/// exits, an exit signal — because a supervisor shutting down a suspended
+/// child would otherwise wait out its whole shutdown timeout and then kill
+/// it, which is the outcome trapping exists to avoid. OTP's own
+/// `sys:suspend_loop` makes the same exception for the same reason.
+type Frozen {
+  FrozenSystem(incoming: sys.Incoming)
+  FrozenExit(exit: process.ExitMessage)
+}
+
 /// Run the actor's initialisation in the newly spawned process and, if it
 /// succeeds, hand over to the loop.
 ///
@@ -1145,19 +1201,6 @@ fn register_self(name: process.Name(message)) -> Result(Nil, String) {
     Ok(Nil) -> Ok(Nil)
     Error(Nil) -> Error("name already registered")
   }
-}
-
-/// What a suspended actor is still willing to receive.
-///
-/// Two things, and no more. The debug plane, because `resume` arrives on it
-/// and a suspension nothing can lift is a hang. And, for an actor that traps
-/// exits, an exit signal — because a supervisor shutting down a suspended
-/// child would otherwise wait out its whole shutdown timeout and then kill
-/// it, which is the outcome trapping exists to avoid. OTP's own
-/// `sys:suspend_loop` makes the same exception for the same reason.
-type Frozen {
-  FrozenSystem(incoming: sys.Incoming)
-  FrozenExit(exit: process.ExitMessage)
 }
 
 /// The receive loop.

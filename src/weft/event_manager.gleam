@@ -1,6 +1,15 @@
 //// A typed `gen_event`: one process holding an ordered list of handlers,
 //// each carrying its own private state.
 ////
+//// ## Flow
+////
+//// `handler` and `handler_with_outcome` close over each handler's private
+//// state. `start` and `supervised` use `actor_builder` to give the handler
+//// list and `handle` to `weft/actor`; this module owns no receive loop.
+//// `notify`, `sync_notify`, `add_handler` and `count_handlers` send `Message`
+//// variants. `handle` calls `fan_out` for notifications, replacing each
+//// handler with the successor returned by its `step`.
+////
 //// ## The problem, and the encoding that answers it
 ////
 //// `gleam_otp` has no `gen_event` binding and probably never will, because
@@ -127,16 +136,33 @@ import weft/internal/sys
 /// `handler`, or with `handler_with_outcome` when the handler needs to
 /// remove itself.
 pub opaque type Handler(event) {
-  Handler(step: fn(event) -> Outcome(event))
+  Handler(
+    /// The closure holding this handler's private state between events.
+    step: fn(event) -> Outcome(event),
+  )
 }
 
 /// What a handler has decided, having seen one event.
 ///
 /// The manager acts on this and nothing else: a handler cannot reach the
 /// manager's list, cannot see its siblings, and cannot stop the manager.
+///
+/// `fan_out` applies each returned outcome while visiting handlers in order.
+///
+/// | Handler outcome | List update | Remaining handlers |
+/// |---|---|---|
+/// | `Keep(handler)` | Successor occupies the same position | Continue |
+/// | `RemoveSelf` | Remove this handler | Continue |
+/// | `Failed(reason)` | Log reason and remove this handler | Continue |
+///
+/// A raised exception returns none of these variants and terminates the
+/// manager process; the table describes declared outcomes only.
 pub type Outcome(event) {
   /// Handled. Use this handler for the next event, in the same position.
-  Keep(handler: Handler(event))
+  Keep(
+    /// The successor that occupies this handler's list position.
+    handler: Handler(event),
+  )
 
   /// Handled. Remove me from the manager; my siblings carry on unchanged.
   RemoveSelf
@@ -144,7 +170,65 @@ pub type Outcome(event) {
   /// This handler is broken and knows it. The manager drops it and logs the
   /// reason. Siblings and the manager itself are unaffected, and that
   /// isolation is gen_event's whole value.
-  Failed(reason: String)
+  Failed(
+    /// The reason logged before removing this handler.
+    reason: String,
+  )
+}
+
+// ----------------------------------------------------------------- traffic
+
+/// What a manager accepts.
+///
+/// Opaque, because every constructor has a function in this module that
+/// sends it correctly — `notify`, `sync_notify`, `add_handler`,
+/// `count_handlers` — and a hand-built `SyncNotify` with the wrong reply
+/// subject is a hang rather than a type error. The type is public so that a
+/// caller can name `process.Name(Message(event))` for `named`, and
+/// `Subject(Message(event))` for whatever it stores the manager in.
+pub opaque type Message(event) {
+  /// Fan the event out to every handler. Nobody is waiting.
+  Notify(
+    /// The event every current handler receives in add order.
+    event: event,
+  )
+
+  /// Fan the event out, then answer `reply`. The reply is what makes the
+  /// caller's wait mean "every handler has finished", so it is sent after
+  /// the fan-out and never before it.
+  SyncNotify(
+    /// The event every current handler receives in add order.
+    event: event,
+    /// Acknowledge only after the complete fan-out returns.
+    reply: Subject(Nil),
+  )
+
+  /// Append a handler. It sees events sent after this message, and no
+  /// earlier ones.
+  AddHandler(
+    /// The handler appended after the current list.
+    handler: Handler(event),
+  )
+
+  /// How many handlers are in the list right now.
+  CountHandlers(
+    /// The channel receiving the current list length.
+    reply: Subject(Int),
+  )
+}
+
+// ----------------------------------------------------------------- builder
+
+/// A description of a manager, ready to `start` or to hand to a supervisor.
+///
+/// Built with `new` and refined with `add` and `named`.
+pub opaque type Builder(event) {
+  Builder(
+    /// The handlers, in the order they will run.
+    handlers: List(Handler(event)),
+    /// The name to register the manager under, if any.
+    name: Option(process.Name(Message(event))),
+  )
 }
 
 /// Build a handler from ordinary state-threading code.
@@ -233,47 +317,6 @@ pub fn handler_with_outcome(
   on_event step: fn(event) -> Outcome(event),
 ) -> Handler(event) {
   Handler(step:)
-}
-
-// ----------------------------------------------------------------- traffic
-
-/// What a manager accepts.
-///
-/// Opaque, because every constructor has a function in this module that
-/// sends it correctly — `notify`, `sync_notify`, `add_handler`,
-/// `count_handlers` — and a hand-built `SyncNotify` with the wrong reply
-/// subject is a hang rather than a type error. The type is public so that a
-/// caller can name `process.Name(Message(event))` for `named`, and
-/// `Subject(Message(event))` for whatever it stores the manager in.
-pub opaque type Message(event) {
-  /// Fan the event out to every handler. Nobody is waiting.
-  Notify(event: event)
-
-  /// Fan the event out, then answer `reply`. The reply is what makes the
-  /// caller's wait mean "every handler has finished", so it is sent after
-  /// the fan-out and never before it.
-  SyncNotify(event: event, reply: Subject(Nil))
-
-  /// Append a handler. It sees events sent after this message, and no
-  /// earlier ones.
-  AddHandler(handler: Handler(event))
-
-  /// How many handlers are in the list right now.
-  CountHandlers(reply: Subject(Int))
-}
-
-// ----------------------------------------------------------------- builder
-
-/// A description of a manager, ready to `start` or to hand to a supervisor.
-///
-/// Built with `new` and refined with `add` and `named`.
-pub opaque type Builder(event) {
-  Builder(
-    /// The handlers, in the order they will run.
-    handlers: List(Handler(event)),
-    /// The name to register the manager under, if any.
-    name: Option(process.Name(Message(event))),
-  )
 }
 
 /// Describe a manager with no handlers.

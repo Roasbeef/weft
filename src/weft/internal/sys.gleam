@@ -1,6 +1,18 @@
 //// The OTP plumbing every weft receive loop shares: the system-message
 //// plane, hibernation, and the one logging edge.
 ////
+//// ## Flow
+////
+//// `new` constructs a running `Plane`. `selecting` installs the system arm
+//// and calls `convert_system_message` at the dynamic boundary. A receive
+//// loop passes a decoded `Request` to `handle`, which sends the reply and
+//// returns the new mode; `GetStatus` uses `status_info` for the OTP shape.
+//// `is_suspended` selects which work the owning loop may receive next.
+//// `hibernate`, `deliver_signals`, `exit_abnormal` and `warn` are separate
+//// process edges, not another receive loop.
+////
+//// ## Terminal and system boundaries
+////
 //// Terminal abnormal exits also pass through this boundary. The one-argument
 //// exit BIF terminates the caller even when it traps exits; sending an exit
 //// signal to itself would only enqueue a message and lose the terminal reason.
@@ -45,20 +57,6 @@ import gleam/otp/system.{
   StatusInfo, Suspend, Suspended,
 }
 
-/// Terminate the caller with the exact abnormal reason supplied by its loop.
-///
-/// This never returns. Unlike exit/2, exit/1 raises an exit in the caller
-/// rather than sending a trappable signal to a destination process.
-///
-/// ## Examples
-///
-/// ```gleam
-/// // sys.exit_abnormal(reason)
-/// // The caller's existing monitors receive reason, not normal.
-/// ```
-@external(erlang, "erlang", "exit")
-pub fn exit_abnormal(reason: Dynamic) -> Nil
-
 /// Something that arrived on the `system` tag.
 ///
 /// A `system`-tagged message is not necessarily one weft knows how to
@@ -85,9 +83,34 @@ pub type Incoming {
 /// mode changes only as the acknowledged half of a handshake, in `handle`,
 /// which is what keeps "the caller has been told" and "the loop has stopped
 /// serving messages" from drifting apart.
+///
+/// `handle` acknowledges each mode change before returning to the loop.
+///
+/// | Mode | System request | Returned mode |
+/// |---|---|---|
+/// | `Running` or `Suspended` | `GetState` or `GetStatus` | Unchanged |
+/// | `Running` or `Suspended` | `Suspend` | `Suspended` |
+/// | `Running` or `Suspended` | `Resume` | `Running` |
+///
+/// The plane stores the mode. The owning loop enforces suspension and owns
+/// any timer freeze policy; the plane does not cancel timers itself.
 pub opaque type Plane {
   Plane(module: Atom, parent: Pid, mode: Mode, debug_state: system.DebugState)
 }
+
+/// Terminate the caller with the exact abnormal reason supplied by its loop.
+///
+/// This never returns. Unlike exit/2, exit/1 raises an exit in the caller
+/// rather than sending a trappable signal to a destination process.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // sys.exit_abnormal(reason)
+/// // The caller's existing monitors receive reason, not normal.
+/// ```
+@external(erlang, "erlang", "exit")
+pub fn exit_abnormal(reason: Dynamic) -> Nil
 
 /// Create a plane for a loop running `module` on behalf of `parent`.
 ///

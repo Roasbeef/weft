@@ -1,5 +1,17 @@
 //// The registry owner and its minimal ETS boundary.
 ////
+//// ## Flow
+////
+//// `start` creates the ETS table inside its linked OTP actor and installs
+//// `handle`. `register` delegates to `register_within`, which validates a
+//// local subject and waits on its reply or the owner's monitor.
+//// `handle` routes `Bind` to `bind`, which checks conflicts before `publish`
+//// installs a fresh monitor and row. `Departed` routes to `retire`, matching
+//// the exact monitor before erasing a binding. `lookup` reads through
+//// `lookup_subject` without using the actor's inbox; `stop` waits for exit.
+////
+//// ## Custody
+////
 //// Binding, conflict detection and monitor cleanup are Gleam actor handlers.
 //// The upstream actor suffices here and keeps the dependency graph acyclic:
 //// weft's richer builders depend on this registry for addressed startup.
@@ -21,28 +33,65 @@ import gleam/result
 
 /// The owner inbox and its unnamed table; neither is a permanent name.
 pub opaque type Registry {
-  Registry(inbox: Subject(Message), table: Table, owner: Pid)
+  Registry(
+    /// Where binding changes and shutdown requests are serialized.
+    inbox: Subject(Message),
+    /// The table owned by `owner`, readable directly by local callers.
+    table: Table,
+    /// The process whose exit invalidates the namespace and its table.
+    owner: Pid,
+  )
 }
 
+/// An unnamed ETS table, created and written only by the registry owner.
+/// The foreign handle stays opaque; callers read through `lookup`.
 type Table
 
+/// One row's routing target and the monitor authorized to reclaim it.
+/// The public typed address preserves the message type after subject erasure.
 type Binding {
-  Binding(recipient: Pid, subject: Dynamic, monitor: Monitor)
+  Binding(
+    /// The local process hosting the subject.
+    recipient: Pid,
+    /// The unnamed subject, erased only at this internal table boundary.
+    subject: Dynamic,
+    /// Cleanup identity for this incarnation, distinct from its address key.
+    monitor: Monitor,
+  )
 }
 
+/// The owner's serialized mutations; application traffic uses the subject
+/// returned by `lookup` and never enters this inbox.
 type Message {
+  /// Register one local subject and report either custody or a conflict.
   Bind(
+    /// Stable address identity minted by the public registry module.
     key: Reference,
+    /// Validated local owner of the unnamed subject.
     recipient: Pid,
+    /// The subject to publish if the binding is accepted.
     subject: Dynamic,
+    /// The caller's one-request reply channel.
     reply: Subject(Result(Nil, String)),
   )
+
+  /// A monitor resolved; cleanup uses its identity, not a recipient lookup.
   Departed(process.Down)
+
+  /// End the namespace; recipients retain their own lifetimes.
   Stop
 }
 
+/// The owner holds the table and each live monitor's cleanup key together.
+/// A replacement drops the old monitor from this map before publishing a row.
+/// An old `Departed` can therefore never erase its replacement.
 type State {
-  State(table: Table, monitors: Dict(Monitor, Reference))
+  State(
+    /// Routing rows, written only from this actor's callbacks.
+    table: Table,
+    /// Cleanup custody for each current binding incarnation.
+    monitors: Dict(Monitor, Reference),
+  )
 }
 
 /// Starts the linked OTP owner.
@@ -120,6 +169,8 @@ pub fn register_within(
   |> result.flatten
 }
 
+/// Serialize one mutation, replying only after the returned state contains
+/// the monitor bookkeeping. The actor runs no other callback in that interval.
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Bind(key, recipient, subject, reply) -> {
@@ -134,6 +185,18 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   }
 }
 
+/// Resolve one binding request against the current row.
+///
+/// | Existing binding | Requested subject | Operation |
+/// |---|---|---|
+/// | None | Live local subject | `publish` |
+/// | Same subject | Live local subject | Keep row and monitor; succeed |
+/// | Different subject, recipient alive | Live local subject | Refuse conflict |
+/// | Different subject, recipient dead | Live local subject | Retire old monitor; `publish` |
+/// | Any | Recipient already dead | Refuse without publishing |
+///
+/// The recipient may die after the liveness check; the installed monitor
+/// still owns cleanup and lookup independently rejects a dead recipient.
 fn bind(
   state: State,
   key: Reference,
@@ -166,6 +229,9 @@ fn bind(
   }
 }
 
+/// Install the monitor before the row, and return both routing and cleanup
+/// custody from the same callback. Recipient death queues `Departed` rather
+/// than interrupting this callback, so the row and map are ready before cleanup.
 fn publish(
   state: State,
   key: Reference,
@@ -182,6 +248,8 @@ fn publish(
   )
 }
 
+/// Remove only the row still carrying this monitor, then release the map
+/// entry. A delayed old DOWN is harmless after replacement removed its custody.
 fn retire(state: State, monitor: Monitor) -> State {
   case dict.get(state.monitors, monitor) {
     Error(Nil) -> state
@@ -238,21 +306,33 @@ pub fn stop(registry: Registry) -> Result(Nil, String) {
   stopped |> result.replace(Nil) |> result.replace_error("registry unavailable")
 }
 
+/// Create an unnamed protected ETS set. The bindings expose no typed ETS
+/// handle, so this internal external supplies the owner-only write boundary.
 @external(erlang, "weft_registry_ffi", "new_table")
 fn new_table() -> Table
 
+/// Read an owner-side row. Only the registry actor uses this operation,
+/// so table deletion is not a concurrent race on this path.
 @external(erlang, "weft_registry_ffi", "read")
 fn read(table: Table, key: Reference) -> Result(Binding, Nil)
 
+/// Write one binding from the table owner. Gleam owns registration policy;
+/// this external supplies the ETS insertion absent from the standard bindings.
 @external(erlang, "weft_registry_ffi", "put")
 fn put(table: Table, key: Reference, binding: Binding) -> Nil
 
+/// Erase one routing row after Gleam has matched its monitor identity.
+/// The external performs no conflict or cleanup policy of its own.
 @external(erlang, "weft_registry_ffi", "delete")
 fn delete(table: Table, key: Reference) -> Nil
 
+/// Read from another local process and reject dead recipients. The Erlang
+/// shim catches table deletion during lookup and returns unavailable.
 @external(erlang, "weft_registry_ffi", "lookup")
 fn lookup_subject(table: Table, key: Reference) -> Result(Subject(message), Nil)
 
+/// Validate the unnamed Subject representation and local pid at the foreign
+/// boundary. Gleam exposes no subject-owner accessor with this validation.
 @external(erlang, "weft_registry_ffi", "local_owner")
 fn local_owner(subject: Subject(message)) -> Result(Pid, String)
 

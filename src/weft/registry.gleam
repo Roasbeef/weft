@@ -1,5 +1,16 @@
 //// Reclaimable addresses for actors that restart inside a long-lived scope.
 ////
+//// ## Flow
+////
+//// `start` creates the internal registry owner. `new_address` mints a typed
+//// reference without publishing a binding. `register_self` creates the
+//// calling process's subject and uses `register` before returning it.
+//// `lookup` reads the current binding through the internal registry; `send`
+//// resolves again on every call. `stop` waits for the registry owner's exit,
+//// which invalidates addresses without stopping their recipients.
+////
+//// ## Address lifetime
+////
 //// An address holds a reference, not an atom or a cached recipient. Binding
 //// publishes one live subject; lookup resolves its current incarnation.
 //// The registry monitors each recipient and removes its binding on death.
@@ -37,7 +48,12 @@ pub type Registry =
 /// The message parameter prevents registering a subject with another message
 /// type. Each address has a unique reference even before its first binding.
 pub opaque type Address(message) {
-  Address(registry: Registry, key: Reference)
+  Address(
+    /// The namespace owner and table used for every resolution.
+    registry: Registry,
+    /// The stable reference whose bound subject may change.
+    key: Reference,
+  )
 }
 
 /// Starts a linked registry with an empty, unnamed table.
