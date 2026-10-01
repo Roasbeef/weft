@@ -18,8 +18,8 @@ Fan a list of tasks out across a bounded pool of processes and get back a
 complete account of what happened to every one of them: the ones that
 succeeded, the ones that failed, the ones that crashed, the ones cancelled
 mid flight, and the ones that never got a slot. Every task is owned by a
-scope process, and the link topology enforces what the API claims: no task
-outlives its scope, and no scope outlives its caller.
+scope process. Worker links propagate an abnormal scope exit; caller death
+initiates cancellation, and the scope remains until its teardown settles.
 
 ```gleam
 import weft
@@ -238,6 +238,16 @@ and freeze correctly under `sys:suspend/1`. Weft covers the ground upstream
 has (so far) chosen not to: transient fan-out with an ownership guarantee,
 and the behaviours whose Erlang APIs don't survive typing without a
 redesign.
+
+## Reading the source
+
+[Architecture](docs/architecture.md) follows a run from admission through
+its account and drain verdict. [The reading guide](docs/reading-guide.md)
+explains the Gleam patterns for an experienced programmer new to the
+language, then gives a reading order through the actual functions.
+Module `Flow` maps and transition tables provide the shorter path when
+reading source. [The plan](docs/plan.md) records design decisions and
+work deliberately left open.
 
 ## Development
 

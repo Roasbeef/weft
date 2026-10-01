@@ -11,6 +11,9 @@ single hex-publishable package, not a monorepo; the vendored linter under
 **`docs/plan.md`** is the plan of record: the module dependency graph, who
 owns which file, and the design rulings already made. Read it before
 planning anything, and rewrite it when you finish a body of work.
+[Architecture](docs/architecture.md) explains process custody, protocol
+ordering and the limits of each guarantee. [Reading guide](docs/reading-guide.md)
+explains the Gleam patterns and the source reading order.
 
 The designs themselves live in the GitHub issues, one per module:
 [#1](https://github.com/Roasbeef/weft/issues/1) the run engine,
