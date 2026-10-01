@@ -51,9 +51,12 @@ let outcomes =
   |> weft.start
 ```
 
-The scope monitors every owner before any worker spawns, holds the task's
-slot until both worker and owner have exited, and only a *normal* owner
-exit proves the subtree drained: an abnormal one is `DrainProofLost`, and a
+The scope monitors every owner before any worker spawns. Managed outcomes
+use the aggregate owner proof to qualify reports, crashes, and never-started
+cancellation entries. Delivery releases an occupied slot, while scope
+completion also waits for the reporting worker's exit.
+Only a *normal* transitive-owner exit proves the subtree drained:
+an abnormal one is `DrainProofLost`, and a
 cancellation whose grace expires with the owner alive is
 `CancellationUnconfirmed`. The scope's own exit reason carries the run's
 drain verdict, so scopes compose: `start_detached` hands back a handle

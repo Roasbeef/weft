@@ -115,9 +115,11 @@
 //// every owner *before it spawns a single worker*, so by the time `begin`
 //// can touch the outside world its ownership evidence is already on file;
 //// there is no window in which externally visible work exists and nobody
-//// holds proof of it. A managed task's slot is then held until **both** its
-//// worker and its owner have exited, and its outcome is delivered only once
-//// both facts are in.
+//// holds proof of it. Managed outcomes use the aggregate owner proof to
+//// qualify reports, crashes, and never-started cancellation entries.
+//// Delivery releases an occupied slot, even if the scope has not yet reaped
+//// the reporting worker's exit. Scope completion separately waits for that
+//// exit through `Scope.finishing`.
 ////
 //// Only a *normal* owner exit proves the subtree drained. An abnormal one
 //// means the proof is gone — not that the work failed, but that nobody can
@@ -150,10 +152,11 @@
 //// process the worker started can publish on the worker's behalf.
 ////
 //// A late publication — one that arrives after cancellation began, or for
-//// a task whose account is already written — is `Refused`, but the owner
-//// is retained and asked to stop all the same. Refusal withholds the
-//// permit to start new work; it never withholds the witness, because an
-//// owner that exists must be drained whatever the run's state.
+//// a task whose account is already written — is `Refused`. A live scope
+//// still retains the owner under monitor. Cancellation dispatches its stop
+//// request using the parent-staging rule below; naming a parent without a
+//// pending proof dispatches it immediately. Refusal solely because the
+//// account is sealed retains the witness without dispatching a stop request.
 ////
 //// An owner may be published *beneath* another owner of the same task
 //// (`adopt_under`, `adopt_leaf_under`). While the parent lives the child is
@@ -501,10 +504,12 @@ pub type Adoption {
   /// wait for its exit. The caller may let the owner's work begin.
   Adopted
 
-  /// The run is cancelling, already sealed this task, or the scope is
-  /// gone. The owner is **still retained and asked to stop** when a scope
-  /// is there to do so — refusal withholds the permit to begin new work,
-  /// never the witness — but the caller must not start anything under it.
+  /// The run is cancelling, already sealed this task, the publication names
+  /// a parent without a pending proof, or the scope is gone. A live scope
+  /// retains the owner under monitor. Cancellation or an orphaned parent
+  /// dispatches its stop request, subject to parent staging; a sealed task
+  /// alone does not. A gone scope admits no
+  /// witness. The caller must not start new work after this answer.
   Refused
 }
 

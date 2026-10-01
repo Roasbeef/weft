@@ -88,8 +88,10 @@ came back for, and it settled these:
   while any is pending, drained only when all are. A task is sealed at
   most once (`Scope.sealed`), so a second owner resolving after a lost
   proof cannot write the account twice.
-- A refused adoption still retains and asks the owner. The permit is what
-  refusal withholds, never the witness.
+- A refused publication to a live scope still retains its owner under
+  monitor. Cancellation or an orphaned parent dispatches a stop request
+  using the existing staging rules. Refusal solely because the account is
+  sealed retains the witness without dispatching a stop request.
 - Owners adopted mid-run are judged by role even when already dead at
   adoption (`ProofPending`, not `ProofAbsent`): the caller asked us to
   witness something it had already started, and whether its death lost a
@@ -288,7 +290,8 @@ Verification on the documentation candidate: `make check` exited 0 with
 clean doc graph. `make docs` exited 0. Comment-free declaration comparison
 preserved every Gleam body, signature and external binding; Erlang code
 was identical after removing comments. Independent correctness review
-remains pending. No runtime behavior, exported signature, dependency,
+identified stale delivery, refusal, and caller-lifetime guarantees; those
+claims now match the handlers. No runtime behavior, exported signature, dependency,
 vendored lint or test changes are part of this pass.
 
 ## Deferred, deliberately
