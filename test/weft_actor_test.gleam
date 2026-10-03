@@ -11,6 +11,7 @@ import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/io
 import gleam/list
 import gleam/otp/actor as otp_actor
 import gleam/otp/static_supervisor as supervisor
@@ -936,4 +937,179 @@ pub fn an_unlinked_actor_survives_its_starters_crash_test() -> Nil {
   process.sleep(50)
   assert process.is_alive(pid)
   process.kill(pid)
+}
+
+// --------------------------------------------- what hibernation reclaims
+
+/// `erlang:garbage_collect/2`, so that a test can compare a forced full
+/// sweep against a hibernation on two actors carrying the same heap.
+@external(erlang, "erlang", "garbage_collect")
+fn garbage_collect(pid: Pid, options: List(#(atom.Atom, atom.Atom))) -> Bool
+
+/// A monotonic reading for the wake-up measurement. Only differences are
+/// used: on this VM the monotonic clock's absolute value is negative.
+@external(erlang, "erlang", "monotonic_time")
+fn monotonic_time(unit: atom.Atom) -> Int
+
+/// Allocated process memory in bytes, which is the quantity
+/// `erlang:memory(processes)` sums over every process.
+fn memory_of(pid: Pid) -> Int {
+  let info = process_info(pid, atom.create("memory"))
+  let assert Ok(bytes) = decode.run(info, decode.at([1], decode.int))
+    as "process_info(memory) answers a two-element tuple"
+  bytes
+}
+
+/// How many elements the actor keeps as live state. Large enough that the
+/// live set dominates rounding, small enough that the test stays quick.
+const live_elements = 100_000
+
+/// How many elements each round of churn allocates and drops.
+const churn_elements = 200_000
+
+/// How many rounds of churn run before the heap is read. Several rounds
+/// rather than one, because a single burst leaves garbage in the young
+/// generation, and what this test needs is a live set that has survived
+/// collections into the old generation.
+const churn_rounds = 8
+
+/// A message for the actor whose heap this test watches.
+type Heap {
+  /// Allocate and drop a large temporary term.
+  Churn
+
+  /// Report the live state's length, which is also a round trip whose
+  /// latency can be timed.
+  Live(reply: Subject(Int))
+}
+
+fn heap_handler(live: List(Int), message: Heap) -> actor.Next(List(Int), Heap) {
+  case message {
+    // The fold's input list is unreachable the moment the handler returns,
+    // so each round leaves garbage the collector has to walk past the live
+    // state to reach. That is what promotes the live state out of the
+    // young generation, which is the condition this test exists to create.
+    Churn -> {
+      let _ = list.fold(list.repeat(1, churn_elements), 0, fn(a, b) { a + b })
+      actor.continue(live)
+    }
+
+    Live(reply:) -> {
+      process.send(reply, list.length(live))
+      actor.continue(live)
+    }
+  }
+}
+
+/// Start one churned actor, optionally hibernating, and return it grown.
+fn churned(
+  hibernate_after: Result(Int, Nil),
+) -> otp_actor.Started(Subject(Heap)) {
+  let builder =
+    actor.new(list.repeat(1, live_elements)) |> actor.on_message(heap_handler)
+
+  let builder = case hibernate_after {
+    Error(Nil) -> builder
+    Ok(ms) -> actor.hibernate_after(builder, ms)
+  }
+  let assert Ok(started) = actor.start(builder)
+    as "the churned actor must start"
+
+  // A call between rounds, so each round's garbage is separated by a
+  // handled message rather than arriving as one burst.
+  list.each(list.repeat(Nil, churn_rounds), fn(_) {
+    process.send(started.data, Churn)
+    assert actor.call(started.data, waiting: 10_000, sending: Live)
+      == live_elements
+  })
+  started
+}
+
+/// Hibernation reclaims garbage and shrinks the heap to the live set. It
+/// does not reclaim the live set, and this test says so in numbers.
+///
+/// Two actors are churned identically. One never hibernates and is read
+/// idle and then after a forced full sweep; the other hibernates on its own
+/// and is read once it has. The three readings bracket what an idle-hibernate
+/// policy can recover: the drop from idle, and no further.
+pub fn hibernation_shrinks_the_heap_without_reclaiming_live_state_test() -> Nil {
+  let awake = churned(Error(Nil))
+  let sleeper = churned(Ok(50))
+
+  // Read the awake actor before the sweep. Nothing has been asked of it
+  // since its last call, so this is the idle reading a census would take.
+  let idle = memory_of(awake.pid)
+  assert garbage_collect(awake.pid, [
+    #(atom.create("type"), atom.create("major")),
+  ])
+  let swept = memory_of(awake.pid)
+
+  // Asserted rather than assumed: a reading taken from an actor that had
+  // not in fact hibernated would be the previous experiment's mistake.
+  process.sleep(300)
+  assert is_hibernating(sleeper.pid)
+  let hibernated = memory_of(sleeper.pid)
+
+  // The live state alone. `live_elements` cons cells at two words each,
+  // plus the heap the actor needs for anything at all, is the floor no
+  // collection of any kind can go below.
+  let floor = live_elements * 2 * 8
+
+  io.println(
+    "hibernation memory, bytes: idle="
+    <> string.inspect(idle)
+    <> " after_major_gc="
+    <> string.inspect(swept)
+    <> " hibernated="
+    <> string.inspect(hibernated)
+    <> " live_floor="
+    <> string.inspect(floor),
+  )
+
+  // What hibernation buys over doing nothing.
+  assert hibernated < idle
+
+  // And what it buys over a forced sweep, which sizes its fresh heap by a
+  // growth policy rather than to the live data.
+  assert hibernated <= swept
+
+  // The finding this test is really for: the live set survives. A
+  // hibernated actor holding a large state still holds it.
+  assert hibernated > floor
+
+  discard(awake.pid)
+  discard(sleeper.pid)
+}
+
+/// The first message after a hibernation pays for the wake-up. This
+/// measures it rather than asserting a bound, because the cost is a full
+/// sweep of whatever the actor happens to hold and so belongs to the
+/// caller's own state, not to weft.
+pub fn a_hibernated_actor_pays_for_its_first_message_test() -> Nil {
+  let sleeper = churned(Ok(50))
+
+  process.sleep(300)
+  assert is_hibernating(sleeper.pid)
+
+  let micro = atom.create("microsecond")
+  let before_wake = monotonic_time(micro)
+  assert actor.call(sleeper.data, waiting: 10_000, sending: Live)
+    == live_elements
+  let woken = monotonic_time(micro) - before_wake
+
+  // The same round trip on the same actor, now awake, is the comparison
+  // that makes the first number mean anything.
+  let before_awake = monotonic_time(micro)
+  assert actor.call(sleeper.data, waiting: 10_000, sending: Live)
+    == live_elements
+  let ordinary = monotonic_time(micro) - before_awake
+
+  io.println(
+    "wake-up round trip, microseconds: hibernated="
+    <> string.inspect(woken)
+    <> " awake="
+    <> string.inspect(ordinary),
+  )
+
+  discard(sleeper.pid)
 }
