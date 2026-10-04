@@ -2301,7 +2301,7 @@ fn adopt_published(
       // owner arrived after that fan-out, so it gets its own ask now. So
       // does a child whose parent is already gone.
       case scope.cancelling || orphaned {
-        True -> dispatch_cancels(scope)
+        True -> dispatch_cancels(scope, scope.owners)
         False -> scope
       }
     }
@@ -2602,13 +2602,29 @@ fn note_exit(scope: Scope(a, e), pid: Pid, reason: ExitReason) -> Scope(a, e) {
 
   case list.key_pop(scope.running, pid) {
     // Still unaccounted, so this worker died instead of answering.
-    Ok(#(index, rest)) ->
-      note_outcome(
-        Scope(..scope, running: rest),
-        classify_exit(index, reason, scope.cancelling),
-      )
+    Ok(#(index, rest)) -> {
+      // Classify before requesting teardown: an external kill remains a
+      // crash, even when that crash now initiates sibling cancellation.
+      let outcome = classify_exit(index, reason, scope.cancelling)
+      let scope = Scope(..scope, running: rest)
+      note_outcome(retire_failed_worker(scope, index), outcome)
+    }
     // Already accounted, or not a worker at all.
     Error(Nil) -> reap_settled_exit(scope, pid, reason)
+  }
+}
+
+/// Stop the resources a worker can no longer coordinate before waiting for
+/// their proof. Waiting first would deadlock an owner whose exit requires its
+/// cancel capability. The failure policy governs siblings, not whether the
+/// failed task's own resources receive their teardown request.
+fn retire_failed_worker(scope: Scope(a, e), index: Int) -> Scope(a, e) {
+  case scope.on_failure {
+    CancelSiblings -> begin_cancel(scope)
+    KeepGoing -> {
+      let owners = list.filter(scope.owners, fn(slot) { slot.index == index })
+      dispatch_cancels(scope, owners)
+    }
   }
 }
 
@@ -2793,7 +2809,7 @@ fn begin_cancel(scope: Scope(a, e)) -> Scope(a, e) {
   // Owners are asked, never killed: each unresolved owner's `cancel` runs on
   // a disposable helper, and the grace — if one was configured — starts now,
   // one window for the whole teardown rather than one per task.
-  let scope = arm_grace(dispatch_cancels(scope))
+  let scope = arm_grace(dispatch_cancels(scope, scope.owners))
 
   // Never-started outcomes route through the ordinary settle so a managed
   // task that never ran still waits for — and is sealed by — its owner's
@@ -2804,15 +2820,20 @@ fn begin_cancel(scope: Scope(a, e)) -> Scope(a, e) {
   list.fold(never_started, scope, note_outcome)
 }
 
-/// Run every unresolved owner's `cancel` on its own disposable helper.
+/// Ask the selected unresolved owners to stop, each on its own helper.
+/// Whole-run cancellation selects every owner; worker loss under KeepGoing
+/// selects only that task's owners. Both preserve staged parent custody.
 ///
 /// One helper per owner, spawned linked so nothing outlives the scope, and
 /// tracked so the scope does not return while one runs. Disposable is the
 /// point: a `cancel` closure that crashes costs the run a log line, never
 /// its witness. Sending every ask before waiting on anything is the same
 /// kill-then-join ordering the workers get.
-fn dispatch_cancels(scope: Scope(a, e)) -> Scope(a, e) {
-  list.fold(scope.owners, scope, fn(scope, slot) {
+fn dispatch_cancels(
+  scope: Scope(a, e),
+  owners: List(OwnerSlot),
+) -> Scope(a, e) {
+  list.fold(owners, scope, fn(scope, slot) {
     // A child under a live parent is the parent's to stop; the parent's
     // own exit will ask it.
     let staged = case slot.parent {
