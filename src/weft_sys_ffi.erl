@@ -7,7 +7,7 @@
 %% that could be honest about it, and the signal-delivery barrier, which
 %% no binding in gleam_erlang provides.
 %%
-%% Everything here is total by construction. `convert_system_message/1`
+%% The message decoder is total by construction. `convert_system_message/1`
 %% answers for any term at all rather than raising a function clause, which
 %% is what lets weft/internal/sys promise that a malformed `system` message
 %% is reported to the loop instead of killing it.

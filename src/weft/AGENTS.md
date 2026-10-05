@@ -1,8 +1,14 @@
 # src/weft — the module graph
 
-Seven public modules here plus three internal ones. The parent directory's
-`weft.gleam` (the run engine) is documented here too, since the graph only
-makes sense whole.
+Eight public modules in the graph, plus three internal ones. The parent
+directory's `weft.gleam` (the run engine) is included here, since its ownership
+protocol connects the modules in this directory.
+
+[Architecture](../../docs/architecture.md) follows admission, delivery and
+drain across the process boundaries. [Reading guide](../../docs/reading-guide.md)
+explains the Gleam patterns and gives a source reading order. Each large
+module carries a short `Flow` map; protocol tables sit beside the types
+whose transitions the relevant dispatcher applies.
 
 ## The modules
 
@@ -22,7 +28,9 @@ makes sense whole.
   child beneath a parent owner, asked only once the parent has exited; `start_witnessed` runs with no consumer at all,
   the scope's exit being the whole report, behind a `Witnessed` handle
   (`witness_pid`, `cancel_witnessed`); `cancel_when_exits` names a
-  consumer whose death cancels. Depends on
+  consumer whose death cancels. An already-dead local consumer prevents task
+  admission; remote consumer death or disconnection cancels asynchronously when
+  its monitor reports DOWN. No remote liveness check or RPC is performed. Depends on
   `gleam_erlang/process` and `internal/sys` (the scope answers the system
   plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
   and slot scheduling would contort an actor loop.
@@ -61,8 +69,8 @@ makes sense whole.
 - **Linkage** — `start` links by default, as OTP does; `unlinked` on the
   actor and machine builders spawns without the link, for a process that
   must neither die with its starter nor take it down (a guard started by
-  the consumer it serves). `supervised` ignores it: a supervisor always
-  links its children.
+  the consumer it serves). `supervised` passes the builder to `start`
+  unchanged; retain linked startup for a supervisor requiring linked children.
 - **`weft/poll`** — bounded synchronous polling in the caller's own
   process (`until` with an immediate first attempt, a last attempt at the
   deadline, `Fail` distinct from `Retry`). Owns no process; depends only
@@ -120,7 +128,7 @@ makes sense whole.
   with an `Adoption` from inside the scope's step); workers → scope via
   `Report(worker, index, result)` then their linked `EXIT`; cancel signals
   and managed owners are watched by monitor (one generic monitor arm,
-  discriminated by pid); each owner's `cancel` runs on a disposable linked
+  discriminated by pid for cancellation and monitor identity for owner proofs); each owner's `cancel` runs on a disposable linked
   helper whose `EXIT` is bookkeeping, not an outcome.
 - Actor: one user-typed `message` per actor; system messages arrive as
   `sys.Incoming` via a record selector, timers as `book.Fired(TimerKey,
@@ -151,11 +159,12 @@ makes sense whole.
    shadow it, and a loop invisible to `sys` is a debugging dead end.
 3. **`sys.handle` sends the sys reply itself.** Replying again from a loop
    double-answers a blocked debug tool.
-4. **Suspension freezes everything but the debug plane and parent exit** —
-   mailbox, injected queues, postponed replay, and timers (disarm on
-   suspend, re-arm from full on resume). A periodic timeout is re-armed
-   from full like any other: the ticks a frozen process could not have
-   acted on are not owed to it afterwards.
+4. **Suspension stops application dispatch.** Actor and machine frozen
+   selectors serve system messages and trapped exits, leaving injected queues
+   and postponed replay untouched. They disarm timers and rearm full durations
+   on resume. The scope serves only its system selector while suspended:
+   caller exit, deadline and grace events wait in its mailbox until resume;
+   its timer durations continue. Untrappable kill still terminates the scope.
 5. **Kill-then-join, in that order** (engine `begin_cancel`): all kills
    sent before any `EXIT` is awaited. Owners are the exception by design:
    they are *asked* (their `cancel`, on a helper) and never killed —
@@ -168,7 +177,12 @@ makes sense whole.
    outcome whose owner has not resolved re-opens the ownership hole weft#5
    closed. With many owners per task the proof consulted is the aggregate
    (`aggregate_proof`), and `Scope.sealed` guarantees a task is written to
-   the account at most once however many owners resolve after it.
+   the account at most once however many owners resolve after it. An
+   unreported worker exit requests teardown immediately (`note_exit` /
+   `retire_failed_worker`), before its outcome waits for that proof.
+   `CancelSiblings` cancels the run; `KeepGoing` asks only the failed task's
+   owners. The original owner monitors still establish drain, and a worker
+   that reports success follows the ordinary completion path.
 7. **A refused adoption still retains the owner** (`adopt_published`):
    refusal withholds the permit to begin new work, never the witness, so
    an owner published after cancellation is monitored, asked to stop, and
@@ -208,7 +222,14 @@ makes sense whole.
     that finishes at once exits unwatched and its clean exit reads as
     `noproc`, a lost proof. `sys.deliver_signals` is the barrier.
     `process.is_alive` is not one on OTP 29, measured: it leaves the
-    overtaking rate unchanged, where `process_info/2` removes it.
+    overtaking rate unchanged, where local `process_info/2` removes it.
+    Remote pids do not use this local barrier; the FFI returns `True`.
+
+16. **Delivery returns the slot before the consumer processes the outcome.**
+    `Next` grants the next delivery; it does not return a slot. `limit` covers
+    occupied slots and scope-held results, with one additional outcome possibly
+    held by the consumer. `finishing` separately requires reported workers to
+    exit before scope completion. No byte or heap budget follows from the count.
 
 ## Dependency edges (enforced by review, not tooling)
 

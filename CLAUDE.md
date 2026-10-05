@@ -11,6 +11,9 @@ single hex-publishable package, not a monorepo; the vendored linter under
 **`docs/plan.md`** is the plan of record: the module dependency graph, who
 owns which file, and the design rulings already made. Read it before
 planning anything, and rewrite it when you finish a body of work.
+[Architecture](docs/architecture.md) explains process custody, protocol
+ordering and the limits of each guarantee. [Reading guide](docs/reading-guide.md)
+explains the Gleam patterns and the source reading order.
 
 The designs themselves live in the GitHub issues, one per module:
 [#1](https://github.com/Roasbeef/weft/issues/1) the run engine,
@@ -57,10 +60,11 @@ prose as unfinished work when reviewing a change.
   performance.
 - Gleam >= 1.18, Erlang/OTP >= 29, erlang target only. All code passes
   `gleam format --check` and compiles warning-free before commit.
-- The link topology in issue #1 is the load-bearing design: no task
-  outlives its scope, no scope outlives its caller, enforced by link
-  propagation rather than by any loop staying alive. Changes to it are
-  design changes and go through the issue, not silent drift.
+- The link topology in issue #1 is the load-bearing design: workers and
+  cancellation helpers are linked to their scope. Caller death initiates
+  cancellation; the scope can outlive that caller while joining processes
+  and resolving managed-owner proofs. Changes to this topology are design
+  changes and go through the issue, not silent drift.
 - `weft/internal/*` modules are internal (enforced by `gleam.toml`).
   Shared machinery (system message handling, timer bookkeeping) lives
   there once and is never written twice.
