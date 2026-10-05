@@ -28,7 +28,9 @@ whose transitions the relevant dispatcher applies.
   child beneath a parent owner, asked only once the parent has exited; `start_witnessed` runs with no consumer at all,
   the scope's exit being the whole report, behind a `Witnessed` handle
   (`witness_pid`, `cancel_witnessed`); `cancel_when_exits` names a
-  consumer whose death cancels. Depends on
+  consumer whose death cancels. An already-dead local consumer prevents task
+  admission; remote consumer death or disconnection cancels asynchronously when
+  its monitor reports DOWN. No remote liveness check or RPC is performed. Depends on
   `gleam_erlang/process` and `internal/sys` (the scope answers the system
   plane); does NOT use `weft/actor` — the scope's kill-then-join teardown
   and slot scheduling would contort an actor loop.

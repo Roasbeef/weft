@@ -317,6 +317,15 @@ identified stale delivery, refusal, and caller-lifetime guarantees; those
 claims now match the handlers. No runtime behavior, exported signature, dependency,
 vendored lint or test changes are part of this pass.
 
+## Remote consumer cancellation
+
+Remote consumers of `cancel_when_exits` use the existing monitor and
+`sys.deliver_signals` primitive. That primitive retains the local already-dead
+admission guard and leaves remote liveness to DOWN delivery. Remote process
+death or connection loss cancels asynchronously; neither proves the remote
+process was alive at task admission. This changes no public API or link
+topology and adds no remote RPC.
+
 ## Deferred, deliberately
 
 - **Detached start** and **the scope answering system messages** — both
