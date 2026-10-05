@@ -977,3 +977,112 @@ pub fn an_owner_that_exits_right_after_adoption_still_proves_drained_test() -> N
     })
   assert lost == 0
 }
+
+// Worker loss and owner drain are separate facts. Cancellation must be asked
+// before the outcome can be released; the owner deliberately waits for this
+// test's release even after the cancel capability has been invoked.
+fn unreported_worker_loss(policy: weft.OnFailure) -> Nil {
+  let #(owner, release_owner) = obedient_owner()
+  let #(sibling, release_sibling) = obedient_owner()
+  let cancelled = process.new_subject()
+  let sibling_cancelled = process.new_subject()
+  let worker_ready = process.new_subject()
+  let sibling_ready = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: fn() {
+            process.send(cancelled, Nil)
+          })
+          as "the worker publishes its native resource before parking"
+        process.send(worker_ready, process.self())
+        process.sleep_forever()
+        Ok(Nil)
+      }),
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner: sibling, cancel: fn() {
+            process.send(sibling_cancelled, Nil)
+          })
+          as "the independent sibling publishes its own resource"
+        process.send(sibling_ready, Nil)
+        Ok(Nil)
+      }),
+    ])
+    |> weft.limit(2)
+    |> weft.on_failure(policy)
+    |> weft.start_detached
+  let scope_exit = watch_exit(weft.scope_pid(detached))
+  let owner_exit = watch_exit(owner)
+  let assert Ok(worker) = process.receive(worker_ready, 2000)
+    as "the doomed worker has completed adoption"
+  assert process.receive(sibling_ready, 2000) == Ok(Nil)
+  process.kill(worker)
+
+  // The ask cannot wait for the very proof it initiates. KeepGoing still
+  // stops the failed task's resources, while preserving independent work.
+  assert process.receive(cancelled, 1000) == Ok(Nil)
+  case policy {
+    weft.CancelSiblings -> {
+      assert process.receive(sibling_cancelled, 1000) == Ok(Nil)
+    }
+    weft.KeepGoing -> {
+      assert process.receive(sibling_cancelled, 50) == Error(Nil)
+    }
+  }
+  assert weft.pull(detached, within: 50) == NotYet
+  assert process.selector_receive(scope_exit, 50) == Error(Nil)
+
+  // Releasing the original adopted owner is what seals the crash. A worker
+  // kill must never substitute for its owner's normal drain proof.
+  process.send(release_owner, DrainCleanly)
+  assert await_exit(owner_exit) == process.Normal
+  assert weft.pull(detached, within: 2000)
+    == PulledOutcome(weft.Crashed(index: 0, reason: process.Killed))
+  assert process.selector_receive(scope_exit, 50) == Error(Nil)
+  process.send(release_sibling, DrainCleanly)
+  assert weft.pull(detached, within: 2000)
+    == PulledOutcome(Completed(index: 1, value: Nil))
+  assert weft.pull(detached, within: 2000) == AllDelivered
+  assert await_exit(scope_exit) == process.Normal
+  assert process.receive(cancelled, 0) == Error(Nil)
+}
+
+pub fn worker_loss_cancels_adopted_resources_before_fail_fast_drain_test() -> Nil {
+  unreported_worker_loss(weft.CancelSiblings)
+}
+
+pub fn worker_loss_under_keep_going_cancels_only_its_own_resources_test() -> Nil {
+  unreported_worker_loss(weft.KeepGoing)
+}
+
+pub fn a_successful_report_waits_for_drain_without_asking_cancellation_test() -> Nil {
+  let #(owner, release_owner) = obedient_owner()
+  let cancelled = process.new_subject()
+  let ready = process.new_subject()
+  let detached =
+    weft.new_prepared([
+      weft.managed(fn(ledger) {
+        let assert weft.Adopted =
+          weft.adopt(ledger, owner:, cancel: fn() {
+            process.send(cancelled, Nil)
+          })
+          as "the successful worker's resource is adopted"
+        process.send(ready, Nil)
+        Ok(Nil)
+      }),
+    ])
+    |> weft.on_failure(weft.CancelSiblings)
+    |> weft.start_detached
+  let scope_exit = watch_exit(weft.scope_pid(detached))
+  assert process.receive(ready, 2000) == Ok(Nil)
+  assert weft.pull(detached, within: 100) == NotYet
+  assert process.receive(cancelled, 0) == Error(Nil)
+  process.send(release_owner, DrainCleanly)
+  assert weft.pull(detached, within: 2000)
+    == PulledOutcome(Completed(index: 0, value: Nil))
+  assert weft.pull(detached, within: 2000) == AllDelivered
+  assert await_exit(scope_exit) == process.Normal
+  assert process.receive(cancelled, 0) == Error(Nil)
+}

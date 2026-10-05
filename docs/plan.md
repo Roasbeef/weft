@@ -100,6 +100,29 @@ came back for, and it settled these:
   outcome is sealed, since no delivery will ever return it, and sends no
   `Done`.
 
+## Managed worker loss (local fix, 2026-10-04)
+
+An unreported worker exit requests teardown before its outcome waits for
+owner drain. Previously, `note_outcome` withheld `Crashed` while an owner
+was pending, and `CancelSiblings` ran only after that proof resolved. An
+owner that required its cancel capability to exit could therefore leave
+both the owner and the scope waiting indefinitely.
+
+`note_exit` classifies the exit before `retire_failed_worker` requests
+teardown, so an external kill remains `Crashed(Killed)`. `CancelSiblings`
+uses the existing whole-run cancellation path. `KeepGoing` selects only
+the failed task's adopted owners for the existing cancellation fan-out.
+Staged children still receive cancellation after their parent exits.
+
+The original owner monitors and aggregate proof still gate outcome delivery
+and scope termination. A worker that already reported success keeps its
+normal drain path. No public API, dependency or link topology changed.
+Three regressions cover cancellation before drain under both policies,
+sibling isolation under `KeepGoing`, and successful completion without a
+cancellation request. `make check` passed with Gleam `1.19.0-rc2`: 186
+tests, no failures, warning-free build, lint zero errors and warnings, and
+a clean documentation graph.
+
 ## Rulings made for periodic timeouts (0.4.1)
 
 - **Fixed delay, not fixed rate.** The next fire is armed once the handler
@@ -316,6 +339,12 @@ vendored lint or test changes are part of this pass.
   questions 2 and 4, plus the hot-upgrade story; all post-1.0 material.
 
 ## Publishing
+
+The managed-worker custody fix above is local and unpublished. Its
+integration route remains pending the user's choice between a Git pin
+through a reviewed PR and a Hex release. Local validation establishes the
+fix's behavior; publication and a consumer dependency update remain
+separate steps.
 
 `0.1.0` and `0.2.0` are on hex.pm (published 2026-09-01). `0.2.0` carries
 managed tasks (#5) and is an additive minor: two new `Outcome` variants

@@ -170,7 +170,12 @@ whose transitions the relevant dispatcher applies.
    outcome whose owner has not resolved re-opens the ownership hole weft#5
    closed. With many owners per task the proof consulted is the aggregate
    (`aggregate_proof`), and `Scope.sealed` guarantees a task is written to
-   the account at most once however many owners resolve after it.
+   the account at most once however many owners resolve after it. An
+   unreported worker exit requests teardown immediately (`note_exit` /
+   `retire_failed_worker`), before its outcome waits for that proof.
+   `CancelSiblings` cancels the run; `KeepGoing` asks only the failed task's
+   owners. The original owner monitors still establish drain, and a worker
+   that reports success follows the ordinary completion path.
 7. **A refused adoption still retains the owner** (`adopt_published`):
    refusal withholds the permit to begin new work, never the witness, so
    an owner published after cancellation is monitored, asked to stop, and
