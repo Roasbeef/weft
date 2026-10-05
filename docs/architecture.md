@@ -192,8 +192,14 @@ replies and returns the new `Plane` mode. Each owning loop controls the work
 it receives and its timer policy. `sys.selecting` is merged last so a user
 selector cannot shadow the debug plane. `convert_system_message` in
 [`weft_sys_ffi.erl`](../src/weft_sys_ffi.erl) accepts any term and decodes the
-supported `GetState`, `GetStatus`, `Suspend` and `Resume` requests.
-Unsupported requests become `Unimplemented`; current loops log them rather
+supported `GetState`, `GetStatus`, `Suspend`, `Resume` and `ChangeCode` requests.
+An opted-in suspended actor or state machine handles `ChangeCode` through
+[`weft/upgrade`](../src/weft/upgrade.gleam): the existing task engine prepares
+a bounded candidate, then the loop replaces state and application callbacks
+together. Failure retains the original implementation. The loader owns code
+verification, loading and resume; manual suspension remains manual. Run scopes
+and non-opted loops answer change-code requests with an explicit refusal.
+Other unsupported requests become `Unimplemented`; current loops log them rather
 than answering. A tool calling an unsupported operation can therefore time
 out. The Erlang boundary also supplies reply tagging, hibernation and the
 local signal-delivery barrier absent from the existing bindings.

@@ -128,6 +128,7 @@ import weft/internal/sys
 import weft/internal/timer as book
 import weft/registry
 import weft/timer.{type Source, WallClock}
+import weft/upgrade
 
 // ---------------------------------------------------------------- interop
 
@@ -451,6 +452,49 @@ pub fn continuing(
 
 // ---------------------------------------------------------------- builder
 
+/// A complete typed replacement, committed only after migration succeeds.
+///
+/// Queues, timers, subject ownership and supervision links stay with the loop.
+/// State types are stable versioned envelopes; there is no arbitrary cast.
+pub type Migration(state, message) {
+  Migration(
+    /// The migrated current state.
+    state: state,
+    /// The newly loaded message handler.
+    on_message: fn(state, message) -> Next(state, message),
+    /// The newly loaded shutdown callback, or no callback.
+    on_shutdown: Option(fn(state, ExitReason) -> Nil),
+    /// The complete user selector, retaining the original inbox subjects.
+    selector: Selector(message),
+    /// The next implementation's migration callback, including downgrade.
+    migrate: fn(upgrade.Request, state) ->
+      Result(Migration(state, message), String),
+  )
+}
+
+/// Opt into state-preserving upgrades while the loop is suspended.
+///
+/// The trusted loader uses sys:suspend, sys:change_code and sys:resume.
+/// A failed callback, timeout or crash leaves every old field intact. The
+/// callback must be pure; weft bounds execution but cannot retract effects.
+/// A downgrade migrates current state rather than restoring a prior snapshot.
+/// Replacement selectors must keep accepting the same message wire format.
+/// Timers resume from their full duration, as for ordinary suspension.
+///
+/// ## Examples
+///
+/// ```gleam
+/// builder |> actor.with_upgrade(within: 100, migrate: migrate)
+/// ```
+pub fn with_upgrade(
+  builder: Builder(state, message, return),
+  within within: Int,
+  migrate migrate: fn(upgrade.Request, state) ->
+    Result(Migration(state, message), String),
+) -> Builder(state, message, return) {
+  Builder(..builder, upgrade: Some(#(within, migrate)))
+}
+
 /// A description of an actor, ready to `start` or to hand to a supervisor.
 ///
 /// Built with `new` or `new_with_initialiser` and refined with the setters
@@ -485,6 +529,13 @@ pub opaque type Builder(state, message, return) {
     periodic: Option(Periodic(message)),
     /// Which clock the loop timeout and the heartbeat are armed on.
     timer_source: Source,
+    /// The opt-in migration contract and computation deadline.
+    upgrade: Option(
+      #(
+        Int,
+        fn(upgrade.Request, state) -> Result(Migration(state, message), String),
+      ),
+    ),
   )
 }
 
@@ -528,6 +579,7 @@ pub fn new(state: state) -> Builder(state, message, Subject(message)) {
     idle_timeout: None,
     periodic: None,
     timer_source: WallClock,
+    upgrade: None,
   )
 }
 
@@ -570,6 +622,7 @@ pub fn new_with_initialiser(
     idle_timeout: None,
     periodic: None,
     timer_source: WallClock,
+    upgrade: None,
   )
 }
 
@@ -1040,6 +1093,13 @@ type Self(state, message) {
   Self(
     /// The OTP debug plane: parent, mode, and the answers to `sys`.
     plane: sys.Plane,
+    /// The current implementation owns how its state migrates next.
+    upgrade: Option(
+      #(
+        Int,
+        fn(upgrade.Request, state) -> Result(Migration(state, message), String),
+      ),
+    ),
     /// The state the programmer's handler sees.
     state: state,
     /// The programmer's selector, already wrapped into `Event`.
@@ -1172,6 +1232,7 @@ fn initialise_actor(
 
       let self =
         Self(
+          upgrade: builder.upgrade,
           plane: sys.new(module: "weft@actor", parent:),
           state:,
           selector: process.map_selector(selector, Received),
@@ -1356,6 +1417,21 @@ fn handle_system(
   incoming: sys.Incoming,
 ) -> Self(state, message) {
   case incoming {
+    sys.ChangeCode(module:, old_version:, extra:, reply:) -> {
+      let changed =
+        change_code(self, upgrade.Request(module:, old_version:, extra:))
+      case changed {
+        Ok(next) -> {
+          reply(Ok(Nil))
+          next
+        }
+        Error(reason) -> {
+          reply(Error(reason))
+          self
+        }
+      }
+    }
+
     sys.Unimplemented(request:) -> {
       sys.warn(
         "weft/actor received an unimplemented system message: "
@@ -1376,6 +1452,37 @@ fn handle_system(
       }
     }
   }
+}
+
+/// Migration cannot touch mailbox or runtime ownership before commit.
+fn change_code(
+  self: Self(state, message),
+  request: upgrade.Request,
+) -> Result(Self(state, message), String) {
+  use _ <- result.try(case sys.is_suspended(self.plane) {
+    True -> Ok(Nil)
+    False -> Error("code change requires suspension")
+  })
+  use configured <- result.try(case self.upgrade {
+    Some(configured) -> Ok(configured)
+    None -> Error("code change is unsupported: no migration callback")
+  })
+  let #(within, migrate) = configured
+  use candidate <- result.try(
+    upgrade.prepare(within, fn() { migrate(request, self.state) }),
+  )
+
+  // One replacement installs the entire implementation after computation.
+  Ok(
+    Self(
+      ..self,
+      state: candidate.state,
+      handler: candidate.on_message,
+      on_shutdown: candidate.on_shutdown,
+      selector: process.map_selector(candidate.selector, Received),
+      upgrade: Some(#(within, candidate.migrate)),
+    ),
+  )
 }
 
 /// Decide what a trapped exit signal means.

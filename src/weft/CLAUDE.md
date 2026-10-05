@@ -1,6 +1,6 @@
 # src/weft — the module graph
 
-Seven public modules in the graph, plus three internal ones. The parent
+Eight public modules in the graph, plus three internal ones. The parent
 directory's `weft.gleam` (the run engine) is included here, since its ownership
 protocol connects the modules in this directory.
 
@@ -89,6 +89,11 @@ whose transitions the relevant dispatcher applies.
   time capability so it needs no adapter. An injected wake may be late or
   duplicated and is dropped when stale; one never delivered costs liveness
   for that arming alone. Imports nothing, so it is a leaf of the graph.
+- **`weft/upgrade`** owns the standard change-code `Request` and bounded
+  candidate preparation. `prepare` uses the existing run engine; the actor
+  and state machine alone commit a typed complete `Migration`. Callback
+  purity is a trust contract, and module loading and resume custody belong
+  to the caller. See Component upgrades below.
 - **`weft/internal/timer`** — the named-timer book: generation-stamped
   fires, `accept` as the only consumption path. Cancel-with-flush is two
   halves: `cancel` stops what it can, `accept` drops what it could not.
@@ -230,11 +235,12 @@ whose transitions the relevant dispatcher applies.
 
 ```
 weft ──────────────► gleam_erlang/process, internal/sys
-weft/actor ────────► internal/{sys,timer}, weft/{timer,registry}, gleam_otp (types)
-weft/state_machine ► internal/{sys,timer}, weft/{timer,registry}, gleam_otp (types)
+weft/actor ────────► internal/{sys,timer}, weft/{timer,registry,upgrade}, gleam_otp (types)
+weft/state_machine ► internal/{sys,timer}, weft/{timer,registry,upgrade}, gleam_otp (types)
 weft/event_manager ► weft/actor, internal/sys (warn ONLY)
 weft/poll ─────────► gleam_erlang/process (sleep only)
 weft/timer ────────► nothing
+weft/upgrade ──────► weft, gleam_erlang/atom (type only)
 weft/registry ─────► internal/registry, gleam_erlang/{process,reference}
 internal/timer ────► gleam_erlang/process, weft/timer
 internal/registry ─► gleam_otp/actor, gleam_erlang/process, weft_registry_ffi (ETS)
@@ -247,3 +253,33 @@ there is no cycle to arrange around.
 
 Adding an edge not in this picture is a design change: it goes through
 `docs/plan.md` and a reviewer, not a quiet import.
+
+
+## Component upgrades
+
+`actor.with_upgrade` and `state_machine.with_upgrade` retain a computation
+deadline and typed migration callback. `Migration` replaces current state,
+selector and every application callback atomically, including the next
+migration callback. The machine additionally replaces current data and its
+enter callback; the actor replaces its shutdown callback. Error paths retain
+the original `Self`. Queues, postponed events, timers, clock source,
+registration and links stay with the runtime. Supported versions share the
+same message type and a stable state envelope; downgrade transforms current
+state rather than restoring a snapshot.
+
+`internal/sys.Incoming.ChangeCode` carries the standard OTP arguments and
+reply continuation. Only suspended opted loops prepare candidates. Run
+scopes and non-opted loops reply unsupported. Preparation is
+`upgrade.prepare -> weft.new/deadline/start`, reusing kill/join rather than
+adding a worker loop. The new dependency graph is
+`actor/state_machine -> upgrade -> weft -> internal/sys`, with no cycle.
+`upgrade.Request` owns dynamic version metadata; its consumers decode it
+without casting state. The shared sys module still owns alias-safe replies.
+
+Trusted migrations must be pure and must return fresh callback references
+and a selector preserving the loop's inboxes. Gleam does not enforce purity,
+and task isolation cannot undo effects. Deadlines bound computation subject
+to scheduler and uninterruptible native-call latency. Parent exit processing
+can be delayed by that bounded preparation. The caller owns validated BEAM
+module loading, single-flight control and guaranteed resume; a manual
+suspension remains suspended until manually resumed.

@@ -60,7 +60,7 @@ import gleam/otp/system.{
 /// Something that arrived on the `system` tag.
 ///
 /// A `system`-tagged message is not necessarily one weft knows how to
-/// answer: OTP defines `replace_state`, `change_code`, `terminate` and the
+/// answer: OTP defines `replace_state`, `terminate` and the
 /// `debug` family too, and a stray tuple can always be sent by hand. Both
 /// possibilities are variants rather than one being a crash, because the
 /// decision about an unimplemented request belongs to the loop — an actor
@@ -70,6 +70,14 @@ pub type Incoming {
   /// replies to the blocked caller. The loop must pass it to `handle`, or
   /// the caller waits forever.
   Request(message: SystemMessage)
+
+  /// A standard OTP change-code request. The loop owns the transactional commit.
+  ChangeCode(
+    module: Atom,
+    old_version: Dynamic,
+    extra: Dynamic,
+    reply: fn(Result(Nil, String)) -> Nil,
+  )
 
   /// A `system`-tagged message with no implementation here. Carries the raw
   /// request so a loop can log what it saw.

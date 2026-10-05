@@ -344,8 +344,8 @@ topology and adds no remote RPC.
   (gen_statem's `infinity`) — shape sketched on #2, waits for a consumer.
 - **`on_handler_exit` / handler refs** for the event manager — waits for
   a real consumer (#3 comments).
-- **`code_change`**, long-lived pools, nested-run discovery — #1 open
-  questions 2 and 4, plus the hot-upgrade story; all post-1.0 material.
+- **Long-lived pools and nested-run discovery** remain open on #1.
+  Component `change_code` has landed as the opt-in primitive below.
 
 ## Publishing
 
@@ -395,3 +395,46 @@ are read), the doc graph check. Verify a gate by its own exit code. New
 public functions carry `## Examples`; new modules carry a `////` header
 with a worked example; `src/weft/CLAUDE.md` and its `AGENTS.md` mirror are
 refreshed when types, messages, or dependency edges move.
+
+
+## Typed component migration
+
+The actor and state machine now opt into standard `sys:change_code` with
+`with_upgrade(within:, migrate:)`. The dynamic boundary remains in shared
+`internal/sys`; it recognizes the OTP tuple once and retains its reply
+continuation. Non-opted loops and run scopes answer unsupported explicitly.
+Only a suspended opted loop can migrate.
+
+`weft/upgrade.prepare` uses the existing run engine to isolate a pure
+migration with a computation deadline and kill/join on timeout. Actor and
+machine callbacks return a complete typed `Migration`: current state/data,
+event/message callback, enter/shutdown callback, selector and next migration
+callback. The loop replaces all those fields in one `Self` construction,
+after the candidate has returned. Errors keep the original `Self`; queues,
+postponed events, timer books, ownership and topology are never candidates
+for replacement. The next downgrade transforms current state, retaining work
+performed since the upgrade.
+
+The new dependency is `actor/state_machine -> upgrade -> weft -> internal/sys`.
+There is no sys-to-upgrade edge and no second worker loop or ownership ledger.
+The shared timer source is runtime-owned and survives along with the timer
+book. A replacement selector must preserve existing inbox routing and wire
+shape. Application callbacks must use freshly loaded references; weft cannot
+prove a supplied closure no longer captures old application code.
+
+Purity is a trusted-callback contract, not an effect-system or kernel
+sandbox guarantee. A dishonest migrator's effects cannot be rolled back.
+The computation deadline excludes scheduler and uninterruptible-native-call
+latency. Parent exit and system requests remain queued until the bounded
+preparation returns. The caller owns validated module loading and a bounded
+controller which resumes on every terminal outcome or controller death;
+manual sys suspension continues to require manual resume.
+
+The regression fixture exercises callback mechanics using standard sys
+calls: PID continuity, mailbox and injected work, postponed replay, periodic
+timer resumption and stale-fire rejection, shutdown and selector replacement,
+enter replacement on the next transition, current-state downgrade, rejection,
+crash, worker death on timeout and unsupported/non-suspended replies. Actual
+new-module loading is a caller integration gate, not proven by this fixture.
+No release manager, forced purge, changing message types, arbitrary patch
+engine or durable storage was added.

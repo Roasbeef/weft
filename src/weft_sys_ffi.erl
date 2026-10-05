@@ -29,7 +29,6 @@ identity(X) -> X.
 %% The system messages OTP defines that weft does not implement yet, and so
 %% reports as `unimplemented`:
 %%   {replace_state, StateFn}
-%%   {change_code, Mod, Vsn, Extra}
 %%   {terminate, Reason}
 %%   {debug, _}
 convert_system_message({system, {From, Ref}, Request}) when is_pid(From) ->
@@ -53,6 +52,14 @@ convert_system_message({system, {From, Ref}, Request}) when is_pid(From) ->
             {request, {suspend, fun() -> Reply(ok) end}};
         resume ->
             {request, {resume, fun() -> Reply(ok) end}};
+        {change_code, Module, OldVersion, Extra} when is_atom(Module) ->
+            {change_code, Module, OldVersion, Extra,
+             fun(Result) ->
+                 case Result of
+                     {ok, nil} -> Reply(ok);
+                     {error, Reason} -> Reply({error, Reason})
+                 end
+             end};
         Other ->
             {unimplemented, Other}
     end;

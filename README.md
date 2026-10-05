@@ -231,6 +231,48 @@ and expiry gives that state back (`RanOut`) rather than only reporting
 that time ran out. Both take an `Interval`, so a long wait can back off
 (`Doubling(from: 25, to: 250)`) instead of probing flat.
 
+## In-place actor and state-machine upgrades
+
+`actor.with_upgrade` and `state_machine.with_upgrade` opt a loop into the
+standard `sys:suspend`, `sys:change_code`, `sys:resume` handshake. The PID,
+registered inboxes, supervision links, injected queues, postponed events and
+timer ownership survive. Ordinary suspension semantics apply to timers:
+resume starts each timer from its full duration and rejects stale fires.
+
+The callback receives an `upgrade.Request` and the current typed state (plus
+current data on a machine). It returns `actor.Migration` or
+`state_machine.Migration`, a complete replacement of state, selector,
+message/event handler, shutdown/enter callback and the next migration
+callback. Those fields are mandatory because loading a new BEAM module does
+not replace captured closures. A downgrade transforms the state as it exists
+after work under the newer implementation; it does not restore a snapshot.
+
+```gleam
+builder |> actor.with_upgrade(within: 100, migrate: migrate)
+```
+
+Migration runs on the existing bounded task engine. Refusal, crash and
+deadline expiry leave the entire original implementation intact; the task is
+joined before the reply. A loop without the setting returns an explicit
+unsupported error, and change-code requests while running are refused.
+Messages and state retain their Gleam types across supported versions, using
+a stable versioned envelope when representations differ. The caller decodes
+request metadata totally and supplies fresh callback references and a
+selector accepting its existing subjects.
+
+Migration must be pure trusted code. Gleam has no effect system, and the
+worker is not a security sandbox: weft cannot undo effects a callback
+performs. The deadline bounds computation, subject to BEAM scheduling and
+kill/join latency; an uninterruptible native call can exceed it. Parent exits
+and other system requests are serviced after that bounded computation.
+The trusted loader owns module verification and loading, single-flight
+coordination, and resuming the loop on success, failure or controller death.
+Manual suspension retains OTP's manual-resume semantics.
+
+This surface is a component migration primitive. It supplies no release
+manager, forced purge, arbitrary VM patching, changing message types or
+persistent storage.
+
 ## Relationship to gleam_otp
 
 Weft is not a fork and not a competing framework. Its types interoperate

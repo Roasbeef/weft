@@ -270,6 +270,7 @@ import weft/internal/sys
 import weft/internal/timer as book
 import weft/registry
 import weft/timer.{type Source, WallClock}
+import weft/upgrade
 
 // ---------------------------------------------------------------- interop
 
@@ -922,6 +923,51 @@ pub fn continuing(
 
 // ---------------------------------------------------------------- builder
 
+/// A complete typed replacement, committed only after migration succeeds.
+///
+/// Queues, timers, subject ownership and supervision links stay with the loop.
+/// State types are stable versioned envelopes; there is no arbitrary cast.
+pub type Migration(state, data, message) {
+  Migration(
+    /// The migrated current state.
+    state: state,
+    /// The migrated current data, including post-upgrade work.
+    data: data,
+    /// The newly loaded event handler.
+    on_event: fn(state, data, message) -> Next(state, data, message),
+    /// The newly loaded enter callback, or no callback.
+    on_enter: Option(fn(state, state, data) -> Enter(state, data, message)),
+    /// The complete user selector, retaining the original inbox subjects.
+    selector: Selector(message),
+    /// The next implementation's migration callback, including downgrade.
+    migrate: fn(upgrade.Request, state, data) ->
+      Result(Migration(state, data, message), String),
+  )
+}
+
+/// Opt into state-preserving upgrades while the loop is suspended.
+///
+/// The trusted loader uses sys:suspend, sys:change_code and sys:resume.
+/// A failed callback, timeout or crash leaves every old field intact. The
+/// callback must be pure; weft bounds execution but cannot retract effects.
+/// A downgrade migrates current state rather than restoring a prior snapshot.
+/// Replacement selectors must keep accepting the same message wire format.
+/// Timers resume from their full duration, as for ordinary suspension.
+///
+/// ## Examples
+///
+/// ```gleam
+/// builder |> state_machine.with_upgrade(within: 100, migrate: migrate)
+/// ```
+pub fn with_upgrade(
+  builder: Builder(state, data, message, return),
+  within within: Int,
+  migrate migrate: fn(upgrade.Request, state, data) ->
+    Result(Migration(state, data, message), String),
+) -> Builder(state, data, message, return) {
+  Builder(..builder, upgrade: Some(#(within, migrate)))
+}
+
 /// A description of a state machine, ready to `start` or to hand to a
 /// supervisor.
 ///
@@ -950,6 +996,14 @@ pub opaque type Builder(state, data, message, return) {
     linkage: Linkage,
     /// Which clock every one of this machine's timeouts is armed on.
     timer_source: Source,
+    /// The opt-in migration contract and computation deadline.
+    upgrade: Option(
+      #(
+        Int,
+        fn(upgrade.Request, state, data) ->
+          Result(Migration(state, data, message), String),
+      ),
+    ),
   )
 }
 
@@ -984,6 +1038,7 @@ pub fn new(
     trap_exits: False,
     linkage: Linked,
     timer_source: WallClock,
+    upgrade: None,
   )
 }
 
@@ -1025,6 +1080,7 @@ pub fn new_with_initialiser(
     trap_exits: False,
     linkage: Linked,
     timer_source: WallClock,
+    upgrade: None,
   )
 }
 
@@ -1373,6 +1429,14 @@ type Self(state, data, message) {
   Self(
     /// The OTP debug plane: parent, mode, and the answers to `sys`.
     plane: sys.Plane,
+    /// The current implementation owns how its state migrates next.
+    upgrade: Option(
+      #(
+        Int,
+        fn(upgrade.Request, state, data) ->
+          Result(Migration(state, data, message), String),
+      ),
+    ),
     /// The state the machine is in. Compared structurally to decide whether
     /// a step is a state change.
     state: state,
@@ -1500,6 +1564,7 @@ fn initialise_machine(
 
       let self =
         Self(
+          upgrade: builder.upgrade,
           plane: sys.new(module: "weft@state_machine", parent:),
           state:,
           data:,
@@ -1686,6 +1751,21 @@ fn handle_system(
   incoming: sys.Incoming,
 ) -> Self(state, data, message) {
   case incoming {
+    sys.ChangeCode(module:, old_version:, extra:, reply:) -> {
+      let changed =
+        change_code(self, upgrade.Request(module:, old_version:, extra:))
+      case changed {
+        Ok(next) -> {
+          reply(Ok(Nil))
+          next
+        }
+        Error(reason) -> {
+          reply(Error(reason))
+          self
+        }
+      }
+    }
+
     sys.Unimplemented(request:) -> {
       sys.warn(
         "weft/state_machine received an unimplemented system message: "
@@ -1724,6 +1804,38 @@ fn handle_system(
 fn rearm_all(self: Self(state, data, message)) -> Self(state, data, message) {
   use self, key, arming <- dict.fold(self.arming, self)
   arm(self, key, arming.after_ms, arming.message, arming.cadence)
+}
+
+/// Migration cannot touch mailbox or runtime ownership before commit.
+fn change_code(
+  self: Self(state, data, message),
+  request: upgrade.Request,
+) -> Result(Self(state, data, message), String) {
+  use _ <- result.try(case sys.is_suspended(self.plane) {
+    True -> Ok(Nil)
+    False -> Error("code change requires suspension")
+  })
+  use configured <- result.try(case self.upgrade {
+    Some(configured) -> Ok(configured)
+    None -> Error("code change is unsupported: no migration callback")
+  })
+  let #(within, migrate) = configured
+  use candidate <- result.try(
+    upgrade.prepare(within, fn() { migrate(request, self.state, self.data) }),
+  )
+
+  // One replacement installs the entire implementation after computation.
+  Ok(
+    Self(
+      ..self,
+      state: candidate.state,
+      data: candidate.data,
+      on_event: candidate.on_event,
+      on_enter: candidate.on_enter,
+      selector: process.map_selector(candidate.selector, Received),
+      upgrade: Some(#(within, candidate.migrate)),
+    ),
+  )
 }
 
 /// Decide what a trapped exit signal means.
