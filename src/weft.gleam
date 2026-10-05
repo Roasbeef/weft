@@ -2217,6 +2217,11 @@ fn step(scope: Scope(a, e), event: Event(a, e)) -> Scope(a, e) {
     // loop can touch another message; only the mode comes back.
     System(incoming: sys.Request(message:)) ->
       Scope(..scope, plane: sys.handle(scope.plane, message, holding: scope))
+    // Run scopes have no callback migration contract.
+    System(incoming: sys.ChangeCode(reply:, ..)) -> {
+      reply(Error("code change is unsupported for run scopes"))
+      scope
+    }
     System(incoming: sys.Unimplemented(..)) -> {
       sys.warn("weft scope ignoring an unimplemented system request")
       scope
