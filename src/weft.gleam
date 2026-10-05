@@ -886,8 +886,10 @@ pub fn cancel_with(run: Run(a, e), signal: Cancel) -> Run(a, e) {
 /// consumer having to be the process that started the run: a stream whose
 /// receiver is gone has nobody to deliver to and should stop its work. The
 /// watch is a monitor, never a link, so firing it ends the run and touches
-/// nothing else. A pid already dead when the run starts cancels it before
-/// any task is spawned, exactly like a spent cancel signal.
+/// nothing else. A local pid already dead when the run starts cancels it before
+/// any task is spawned, exactly like a spent cancel signal. Remote death or
+/// disconnection cancels when the monitor's DOWN arrives; there is no remote
+/// liveness check, so that observation can follow task admission.
 ///
 /// ## Examples
 ///
@@ -2077,15 +2079,16 @@ fn run_scope(
   loop(watch_pids(watch_signal(scope, signal), watched))
 }
 
-/// Watch every `cancel_when_exits` pid the same way the signal is watched:
-/// by monitor, with the liveness check that a queued `noproc` cannot beat
-/// `fill_slots` to.
+/// Install each consumer monitor before checking local liveness, so an already
+/// dead local pid cannot lose the race to `fill_slots`. The existing signal
+/// barrier leaves remote liveness to its monitor: neither a remote process exit
+/// nor disconnection is a synchronous admission oracle.
 fn watch_pids(scope: Scope(a, e), watched: List(Pid)) -> Scope(a, e) {
   list.fold(watched, scope, fn(scope, pid) {
     let _watch = process.monitor(pid)
 
     let scope = Scope(..scope, signal_pids: [pid, ..scope.signal_pids])
-    case process.is_alive(pid) {
+    case sys.deliver_signals(pid) {
       True -> scope
       False -> begin_cancel(scope)
     }
